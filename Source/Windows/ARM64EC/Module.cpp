@@ -584,6 +584,11 @@ static void LogGuestAccessViolation(const EXCEPTION_RECORD& Rec, const ARM64_NT_
   }
   LogFaultRegion("guest", Guest.Pc);
   LogFaultRegion("fault", Rec.ExceptionInformation[1]);
+  // A stale translation can reconstruct RIP into an immediate in the current
+  // guest bytes. Include the preceding window to recover instruction boundaries.
+  if (Guest.Pc >= 64) {
+    LogFaultCode("guest-before", Guest.Pc - 64, 64);
+  }
   LogFaultCode("guest", Guest.Pc, 64);
   LogFaultCode("host", Host.Pc, 16);
   LogMan::Msg::IFmt("FEX-AV end {}", Index);
@@ -651,6 +656,16 @@ public:
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
+    if (AppConfigName == "Cosmoteer.exe") {
+      // This hook also receives explicit guest invalidations; a line alone is
+      // not proof of a failed code-byte validation. Keep the capture bounded.
+      static std::atomic<uint32_t> Count {};
+      const auto Index = Count.fetch_add(1, std::memory_order_relaxed);
+      if (Index < 32) {
+        LogMan::Msg::IFmt("FEX-SMC guest invalidation {} start={:X} length={:X} rip={:X}", Index, Start, Length,
+                          Thread->CurrentFrame->State.rip);
+      }
+    }
     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
   }
 
@@ -699,10 +714,14 @@ NTSTATUS ProcessInit() {
   FEXCore::Config::ReloadMetaLayer();
   if (AppConfigName == "Cosmoteer.exe") {
     FEXCore::Config::Set(FEXCore::Config::CONFIG_SILENTLOG, "0");
+    // Diagnostic workaround for CoreCLR's mapped executable code: writes via
+    // a separate writable view need not fault on the executable view. Validate
+    // instruction bytes instead of relying solely on write-protection traps.
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCCHECKS, "2"); // CONFIG_SMC_FULL
   }
   FEX::Windows::Logging::Init();
   if (AppConfigName == "Cosmoteer.exe") {
-    LogMan::Msg::IFmt("FEX-AV diagnostic enabled: first 16 guest access violations; execution behavior unchanged");
+    LogMan::Msg::IFmt("FEX-SMC diagnostic round 2: full instruction-byte validation enabled; first 32 guest invalidations and 16 access violations");
   }
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, AppConfigName);
