@@ -51,6 +51,7 @@ $end_info$
 #include "Windows/Common/SHMStats.h"
 
 #include <cstdint>
+#include <atomic>
 #include <cstdio>
 #include <type_traits>
 #include <mutex>
@@ -542,6 +543,52 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   return ECContext;
 }
 
+// Diagnostic only: never dereference guest code directly in an exception handler.
+static void LogFaultCode(const char* Kind, uint64_t Address, SIZE_T Size) {
+  uint8_t Bytes[64] {};
+  SIZE_T Read {};
+  const auto Status = NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<const void*>(Address), Bytes, Size, &Read);
+  LogMan::Msg::IFmt("FEX-AV {} code address={:X} status={:X} bytes={}", Kind, Address, static_cast<uint32_t>(Status), Read);
+  for (SIZE_T Offset = 0; Offset < Read && Offset < sizeof(Bytes); ++Offset) {
+    LogMan::Msg::IFmt("FEX-AV {} byte +{:02X}={:02X}", Kind, Offset, Bytes[Offset]);
+  }
+}
+
+static void LogFaultRegion(const char* Kind, uint64_t Address) {
+  MEMORY_BASIC_INFORMATION Info {};
+  const auto Status = NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<const void*>(Address), MemoryBasicInformation,
+                                           &Info, sizeof(Info), nullptr);
+  LogMan::Msg::IFmt("FEX-AV {} region address={:X} status={:X} base={:X} allocation={:X} size={:X} state={:X} protect={:X} type={:X}",
+                    Kind, Address, static_cast<uint32_t>(Status), reinterpret_cast<uintptr_t>(Info.BaseAddress),
+                    reinterpret_cast<uintptr_t>(Info.AllocationBase), Info.RegionSize, Info.State, Info.Protect, Info.Type);
+}
+
+static void LogGuestAccessViolation(const EXCEPTION_RECORD& Rec, const ARM64_NT_CONTEXT& Host, const ARM64_NT_CONTEXT& Guest) {
+  if (AppConfigName != "Cosmoteer.exe" || Rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || Rec.NumberParameters < 2) {
+    return;
+  }
+  // Include first-chance faults, which may be handled by the runtime, but bound total output.
+  static std::atomic<uint32_t> Count {};
+  const auto Index = Count.fetch_add(1, std::memory_order_relaxed);
+  if (Index >= 16) {
+    return;
+  }
+  LogMan::Msg::IFmt("FEX-AV begin {} host-pc={:X} guest-rip={:X} access={} fault={:X}", Index, Host.Pc, Guest.Pc,
+                    Rec.ExceptionInformation[0], Rec.ExceptionInformation[1]);
+  LogMan::Msg::IFmt("FEX-AV rax={:X} rcx={:X} rdx={:X} rbx={:X}", Guest.X8, Guest.X0, Guest.X1, Guest.X27);
+  LogMan::Msg::IFmt("FEX-AV rsp={:X} rbp={:X} rsi={:X} rdi={:X}", Guest.Sp, Guest.Fp, Guest.X25, Guest.X26);
+  LogMan::Msg::IFmt("FEX-AV r8={:X} r9={:X} r10={:X} r11={:X}", Guest.X2, Guest.X3, Guest.X4, Guest.X5);
+  LogMan::Msg::IFmt("FEX-AV r12={:X} r13={:X} r14={:X} r15={:X}", Guest.X19, Guest.X20, Guest.X21, Guest.X22);
+  for (unsigned Reg = 0; Reg < 31; ++Reg) {
+    LogMan::Msg::IFmt("FEX-AV host-x{}={:X}", Reg, Host.X[Reg]);
+  }
+  LogFaultRegion("guest", Guest.Pc);
+  LogFaultRegion("fault", Rec.ExceptionInformation[1]);
+  LogFaultCode("guest", Guest.Pc, 64);
+  LogFaultCode("host", Host.Pc, 16);
+  LogMan::Msg::IFmt("FEX-AV end {}", Index);
+}
+
 static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
   auto* Thread = GetCPUArea().ThreadState();
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
@@ -562,6 +609,7 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
 
   BOOL FirstChance = TRUE;
   EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, Rec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
+  LogGuestAccessViolation(GuestRec, Context, GuestContext);
   if (GuestRec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
     GuestContext.Cpsr &= ~(1 << 21); // PSTATE.SS
   } else if (GuestRec.ExceptionCode == EXCEPTION_BREAKPOINT) {
@@ -649,7 +697,13 @@ NTSTATUS ProcessInit() {
   AppConfigName = FEX::Windows::BaseName(ExecutablePath);
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
+  if (AppConfigName == "Cosmoteer.exe") {
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_SILENTLOG, "0");
+  }
   FEX::Windows::Logging::Init();
+  if (AppConfigName == "Cosmoteer.exe") {
+    LogMan::Msg::IFmt("FEX-AV diagnostic enabled: first 16 guest access violations; execution behavior unchanged");
+  }
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, AppConfigName);
 
