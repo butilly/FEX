@@ -487,7 +487,22 @@ public:
   }
 
   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
-    return InvalidationTracker->QueryExecutableRange(Address);
+    auto Range = InvalidationTracker->QueryExecutableRange(Address);
+    if (!Range.Size) {
+      // Keep the first rejected mappings without flooding a recursive exception loop.
+      static std::atomic<unsigned> DiagnosticCount {};
+      if (DiagnosticCount.fetch_add(1, std::memory_order_relaxed) < 8) {
+        MEMORY_BASIC_INFORMATION Info {};
+        const auto QuerySize = VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info));
+        ULONG ExecuteFlags {};
+        const auto Status = NtQueryInformationProcess(NtCurrentProcess(), ProcessExecuteFlags, &ExecuteFlags, sizeof(ExecuteFlags), nullptr);
+        LogMan::Msg::EFmt("WOW64 NoExec mapping: guest={:X} query={} base={:X} size={:X} state={:X} protect={:X} type={:X} "
+                         "execute_flags={:X} status={:X}",
+                         Address, QuerySize, reinterpret_cast<uintptr_t>(Info.BaseAddress), Info.RegionSize, Info.State, Info.Protect,
+                         Info.Type, ExecuteFlags, static_cast<uint32_t>(Status));
+      }
+    }
+    return Range;
   }
 
   void PreCompile() override {
@@ -534,6 +549,15 @@ void BTCpuProcessInit() {
   CTX->InitCore();
   Context::HandlerConfig.emplace(*CTX);
   InvalidationTracker.emplace(*CTX, Threads);
+  // The process policy may already have been set before this BT module loaded.
+  // The change notification only covers subsequent updates; seed the tracker too.
+  ULONG ExecuteFlags {};
+  const auto ExecuteStatus =
+    NtQueryInformationProcess(NtCurrentProcess(), ProcessExecuteFlags, &ExecuteFlags, sizeof(ExecuteFlags), nullptr);
+  if (NT_SUCCESS(ExecuteStatus)) {
+    InvalidationTracker->HandleProcessExecuteFlagsChange(ExecuteFlags);
+  }
+  LogMan::Msg::IFmt("WOW64 initial execute policy: flags={:X} status={:X}", ExecuteFlags, static_cast<uint32_t>(ExecuteStatus));
   ImageTracker.emplace(*CTX, false);
 
   auto MainModule = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress;
