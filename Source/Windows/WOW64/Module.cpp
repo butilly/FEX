@@ -117,6 +117,7 @@ WOW64_CONTEXT* GetWow64Context() {
 struct FrontendThreadData {
   bool InLockedRWXRead {};
   CHPE_V2_CPU_AREA_INFO CpuArea {};
+  uint64_t ExceptionDiagnosticCount {};
 
   FrontendThreadData(const TLS& TLS) {
     CpuArea.SuspendDoorbell = reinterpret_cast<ULONG*>(&TLS.ThreadState()->CurrentFrame->SuspendDoorbell);
@@ -144,6 +145,8 @@ std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
 
 std::mutex ThreadCreationMutex;
+bool DiagnoseWebclientExceptions {};
+bool TerminateWebclientFastFail {};
 // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
 std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
 
@@ -500,6 +503,7 @@ void BTCpuProcessInit() {
   FEX::Windows::SetupThreadHandlers();
   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
   const auto ExecutableName = FEX::Windows::BaseName(ExecutablePath);
+  DiagnoseWebclientExceptions = ExecutableName == "webclient.exe";
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
@@ -515,6 +519,7 @@ void BTCpuProcessInit() {
   SyscallHandler = fextl::make_unique<WowSyscallHandler>();
   const auto NtDll = GetModuleHandleW(L"ntdll.dll");
   const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
+  TerminateWebclientFastFail = IsWine && DiagnoseWebclientExceptions;
   OvercommitTracker.emplace(IsWine);
 
   FEX::Windows::Allocator::SetupHooks(NtDll);
@@ -784,12 +789,27 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
     return true;
   }
 
-  LogMan::Msg::DFmt("Reconstructing context");
+  // Keep the first events and logarithmic progress samples without filling the
+  // report with identical dispatcher faults. Other processes retain their logs.
+  const uint64_t DiagnosticCount = DiagnoseWebclientExceptions ? ++GetFrontendThreadData(Thread)->ExceptionDiagnosticCount : 0;
+  const bool LogException = !DiagnoseWebclientExceptions || DiagnosticCount <= 4 || (DiagnosticCount & (DiagnosticCount - 1)) == 0;
+  if (LogException) {
+    LogMan::Msg::DFmt("Reconstructing context");
+  }
 
   WOW64_CONTEXT* WowContext = Context::ReconstructWowContext(Context);
-  LogMan::Msg::DFmt("pc: {:X} eip: {:X} code: {:X}", Context->Pc, WowContext->Eip, Exception->ExceptionCode);
+  if (LogException) {
+    LogMan::Msg::DFmt("pc: {:X} eip: {:X} code: {:X}", Context->Pc, WowContext->Eip, Exception->ExceptionCode);
+  }
 
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+  if (DiagnoseWebclientExceptions && LogException) {
+    LogMan::Msg::DFmt("WOW64 exception diagnostic #{}: generated={} signal={} trap={} err={:X} ecx={:X} host_params={} access={:X} address={:X}",
+                      DiagnosticCount, Fault.FaultToTopAndGeneratedException, Fault.Signal, Fault.TrapNo, Fault.err_code,
+                      WowContext->Ecx, Exception->NumberParameters,
+                      Exception->NumberParameters > 0 ? Exception->ExceptionInformation[0] : 0,
+                      Exception->NumberParameters > 1 ? Exception->ExceptionInformation[1] : 0);
+  }
   BOOL FirstChance = TRUE;
   EXCEPTION_RECORD GuestException =
     FEX::Windows::HandleGuestException(Fault, *Exception, WowContext->Eip, WowContext->Eax, WowContext->Ecx, FirstChance);
@@ -799,7 +819,29 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
 
   Context::UnlockJITContext();
-  NtRaiseException(&GuestException, GetTLS().EntryContext(), FirstChance);
+  if (DiagnoseWebclientExceptions && LogException) {
+    const auto* Entry = GetTLS().EntryContext();
+    LogMan::Msg::DFmt("WOW64 exception dispatch #{}: code={:X} flags={:X} first_chance={} guest={:X} params={} info0={:X} entry_pc={:X} entry_sp={:X} context_flags={:X}",
+                      DiagnosticCount, GuestException.ExceptionCode, GuestException.ExceptionFlags, FirstChance,
+                      reinterpret_cast<uintptr_t>(GuestException.ExceptionAddress), GuestException.NumberParameters,
+                      GuestException.NumberParameters > 0 ? GuestException.ExceptionInformation[0] : 0,
+                      Entry->Pc, Entry->Sp, Entry->ContextFlags);
+  }
+  // The affected Wine WOW64 path resumes the entry context for this helper's
+  // second-chance INT 0x29, re-executing the same terminal instruction forever.
+  // With no debugger, fast-fail must terminate without invoking guest handlers.
+  // Keep ordinary exceptions and debugger delivery on the normal path.
+  if (TerminateWebclientFastFail && !FirstChance && GuestException.ExceptionCode == STATUS_STACK_BUFFER_OVERRUN &&
+      (GuestException.ExceptionFlags & EXCEPTION_NONCONTINUABLE) && !reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->BeingDebugged) {
+    LogMan::Msg::DFmt("WOW64 fast-fail termination: guest={:X} code={:X} reason={:X}", WowContext->Eip,
+                      GuestException.ExceptionCode, GuestException.ExceptionInformation[0]);
+    const NTSTATUS TerminateStatus = NtTerminateProcess(NtCurrentProcess(), GuestException.ExceptionCode);
+    LogMan::Msg::EFmt("WOW64 fast-fail termination returned: status={:X}", static_cast<uint32_t>(TerminateStatus));
+  }
+  const NTSTATUS RaiseStatus = NtRaiseException(&GuestException, GetTLS().EntryContext(), FirstChance);
+  if (DiagnoseWebclientExceptions && LogException) {
+    LogMan::Msg::DFmt("WOW64 exception returned #{}: status={:X}", DiagnosticCount, static_cast<uint32_t>(RaiseStatus));
+  }
   return false;
 }
 
