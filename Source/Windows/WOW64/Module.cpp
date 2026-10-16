@@ -117,6 +117,7 @@ WOW64_CONTEXT* GetWow64Context() {
 struct FrontendThreadData {
   bool InLockedRWXRead {};
   CHPE_V2_CPU_AREA_INFO CpuArea {};
+  uint64_t ExceptionDiagnosticCount {};
 
   FrontendThreadData(const TLS& TLS) {
     CpuArea.SuspendDoorbell = reinterpret_cast<ULONG*>(&TLS.ThreadState()->CurrentFrame->SuspendDoorbell);
@@ -144,6 +145,7 @@ std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
 
 std::mutex ThreadCreationMutex;
+bool DiagnoseWebclientExceptions {};
 // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
 std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
 
@@ -500,6 +502,7 @@ void BTCpuProcessInit() {
   FEX::Windows::SetupThreadHandlers();
   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
   const auto ExecutableName = FEX::Windows::BaseName(ExecutablePath);
+  DiagnoseWebclientExceptions = ExecutableName == "webclient.exe";
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
@@ -784,12 +787,27 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
     return true;
   }
 
-  LogMan::Msg::DFmt("Reconstructing context");
+  // Keep the first events and logarithmic progress samples without filling the
+  // report with identical dispatcher faults. Other processes retain their logs.
+  const uint64_t DiagnosticCount = DiagnoseWebclientExceptions ? ++GetFrontendThreadData(Thread)->ExceptionDiagnosticCount : 0;
+  const bool LogException = !DiagnoseWebclientExceptions || DiagnosticCount <= 4 || (DiagnosticCount & (DiagnosticCount - 1)) == 0;
+  if (LogException) {
+    LogMan::Msg::DFmt("Reconstructing context");
+  }
 
   WOW64_CONTEXT* WowContext = Context::ReconstructWowContext(Context);
-  LogMan::Msg::DFmt("pc: {:X} eip: {:X} code: {:X}", Context->Pc, WowContext->Eip, Exception->ExceptionCode);
+  if (LogException) {
+    LogMan::Msg::DFmt("pc: {:X} eip: {:X} code: {:X}", Context->Pc, WowContext->Eip, Exception->ExceptionCode);
+  }
 
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+  if (DiagnoseWebclientExceptions && LogException) {
+    LogMan::Msg::DFmt("WOW64 exception diagnostic #{}: generated={} signal={} trap={} err={:X} ecx={:X} host_params={} access={:X} address={:X}",
+                      DiagnosticCount, Fault.FaultToTopAndGeneratedException, Fault.Signal, Fault.TrapNo, Fault.err_code,
+                      WowContext->Ecx, Exception->NumberParameters,
+                      Exception->NumberParameters > 0 ? Exception->ExceptionInformation[0] : 0,
+                      Exception->NumberParameters > 1 ? Exception->ExceptionInformation[1] : 0);
+  }
   BOOL FirstChance = TRUE;
   EXCEPTION_RECORD GuestException =
     FEX::Windows::HandleGuestException(Fault, *Exception, WowContext->Eip, WowContext->Eax, WowContext->Ecx, FirstChance);
@@ -799,7 +817,18 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
 
   Context::UnlockJITContext();
-  NtRaiseException(&GuestException, GetTLS().EntryContext(), FirstChance);
+  if (DiagnoseWebclientExceptions && LogException) {
+    const auto* Entry = GetTLS().EntryContext();
+    LogMan::Msg::DFmt("WOW64 exception dispatch #{}: code={:X} flags={:X} first_chance={} guest={:X} params={} info0={:X} entry_pc={:X} entry_sp={:X} context_flags={:X}",
+                      DiagnosticCount, GuestException.ExceptionCode, GuestException.ExceptionFlags, FirstChance,
+                      reinterpret_cast<uintptr_t>(GuestException.ExceptionAddress), GuestException.NumberParameters,
+                      GuestException.NumberParameters > 0 ? GuestException.ExceptionInformation[0] : 0,
+                      Entry->Pc, Entry->Sp, Entry->ContextFlags);
+  }
+  const NTSTATUS RaiseStatus = NtRaiseException(&GuestException, GetTLS().EntryContext(), FirstChance);
+  if (DiagnoseWebclientExceptions && LogException) {
+    LogMan::Msg::DFmt("WOW64 exception returned #{}: status={:X}", DiagnosticCount, static_cast<uint32_t>(RaiseStatus));
+  }
   return false;
 }
 
