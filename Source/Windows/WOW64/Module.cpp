@@ -146,6 +146,7 @@ std::optional<FEX::Windows::ImageTracker> ImageTracker;
 
 std::mutex ThreadCreationMutex;
 bool DiagnoseWebclientExceptions {};
+bool TerminateWebclientFastFail {};
 // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
 std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
 
@@ -518,6 +519,7 @@ void BTCpuProcessInit() {
   SyscallHandler = fextl::make_unique<WowSyscallHandler>();
   const auto NtDll = GetModuleHandleW(L"ntdll.dll");
   const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
+  TerminateWebclientFastFail = IsWine && DiagnoseWebclientExceptions;
   OvercommitTracker.emplace(IsWine);
 
   FEX::Windows::Allocator::SetupHooks(NtDll);
@@ -824,6 +826,17 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
                       reinterpret_cast<uintptr_t>(GuestException.ExceptionAddress), GuestException.NumberParameters,
                       GuestException.NumberParameters > 0 ? GuestException.ExceptionInformation[0] : 0,
                       Entry->Pc, Entry->Sp, Entry->ContextFlags);
+  }
+  // The affected Wine WOW64 path resumes the entry context for this helper's
+  // second-chance INT 0x29, re-executing the same terminal instruction forever.
+  // With no debugger, fast-fail must terminate without invoking guest handlers.
+  // Keep ordinary exceptions and debugger delivery on the normal path.
+  if (TerminateWebclientFastFail && !FirstChance && GuestException.ExceptionCode == STATUS_STACK_BUFFER_OVERRUN &&
+      (GuestException.ExceptionFlags & EXCEPTION_NONCONTINUABLE) && !reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->BeingDebugged) {
+    LogMan::Msg::DFmt("WOW64 fast-fail termination: guest={:X} code={:X} reason={:X}", WowContext->Eip,
+                      GuestException.ExceptionCode, GuestException.ExceptionInformation[0]);
+    const NTSTATUS TerminateStatus = NtTerminateProcess(NtCurrentProcess(), GuestException.ExceptionCode);
+    LogMan::Msg::EFmt("WOW64 fast-fail termination returned: status={:X}", static_cast<uint32_t>(TerminateStatus));
   }
   const NTSTATUS RaiseStatus = NtRaiseException(&GuestException, GetTLS().EntryContext(), FirstChance);
   if (DiagnoseWebclientExceptions && LogException) {
