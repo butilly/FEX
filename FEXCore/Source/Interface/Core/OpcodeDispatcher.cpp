@@ -3027,6 +3027,15 @@ void OpDispatchBuilder::EnterOp(OpcodeArgs) {
   StoreGPRRegister(X86State::REG_RBP, temp_RBP);
 }
 
+void OpDispatchBuilder::SLDTOp(OpcodeArgs) {
+  // Report a null LDTR in our user-mode descriptor-table model. In particular,
+  // the Windows frontend uses GDT selectors and does not load a guest LDT.
+  // Memory destinations are always 16 bits, regardless of operand size;
+  // register destinations zero-extend the selector to the operand size.
+  const auto DstSize = DestIsMem(Op) ? OpSize::i16Bit : OpSizeFromDst(Op);
+  StoreResultGPR_WithOpSize(Op, Op->Dest, Constant(0), DstSize);
+}
+
 void OpDispatchBuilder::SGDTOp(OpcodeArgs) {
   auto DestAddress = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.LoadData = false});
 
