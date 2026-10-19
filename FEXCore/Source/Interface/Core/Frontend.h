@@ -90,6 +90,9 @@ public:
   }
 
 private:
+  // Bound failure diagnostics independently of speculative multiblock decoding.
+  uint32_t EntryFailureLogs {};
+
   // To pass any information from instruction prefixes
   // down into the actual instruction handling machinery.
   struct DecodedHeader {

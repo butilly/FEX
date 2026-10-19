@@ -1656,6 +1656,30 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
                             BlockIt->BlockStatus == DecodedBlockStatus::UNIMPLEMENTED_INST ? "Unimplemented" :
                                                                                              "PartialDecode",
                             OpAddress);
+          if (PCOffset == 0 && EntryFailureLogs < 16 &&
+              (BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST ||
+               BlockIt->BlockStatus == DecodedBlockStatus::UNIMPLEMENTED_INST)) {
+            ++EntryFailureLogs;
+            // Read only within the executable range already validated by the
+            // decoder. Do not probe another page or change the decode result.
+            // Use the adjusted stream so special code regions are respected.
+            std::array<char, MAX_INST_SIZE * 3 + 1> Bytes {};
+            constexpr char Hex[] = "0123456789abcdef";
+            const auto Address = reinterpret_cast<uint64_t>(InstStream.InstStream);
+            size_t Count = 0;
+            if (Address >= ExecutableRangeBase && Address < ExecutableRangeEnd) {
+              const auto Available = std::min<uint64_t>(MAX_INST_SIZE, ExecutableRangeEnd - Address);
+              for (; Count < Available; ++Count) {
+                const auto Byte = InstStream.AdjustedInstStream[Count];
+                Bytes[Count * 3] = Hex[Byte >> 4];
+                Bytes[Count * 3 + 1] = Hex[Byte & 15];
+                Bytes[Count * 3 + 2] = ' ';
+              }
+            }
+            LogMan::Msg::EFmt("Entry decode detail: pc={:X} mode={} op={:X} flags={:X} consumed={} bytes({})={}",
+                              OpAddress, BlockInfo.Is64BitMode ? 64 : 32, DecodeInst->OP, DecodeInst->Flags,
+                              InstructionSize, Count, Bytes.data());
+          }
         }
         break;
       }
