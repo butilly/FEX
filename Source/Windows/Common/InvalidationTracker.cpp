@@ -16,6 +16,8 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
   , Threads {Threads} {
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
+  FEX_CONFIG_OPT(SMCRWXFull, SMCRWXFULL);
+  ValidateRWXInstructions = SMCRWXFull;
 
   MEMORY_BASIC_INFORMATION Info;
   uint64_t Address = 0;
@@ -213,6 +215,12 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
 }
 
 void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size) {
+  if (ValidateRWXInstructions) {
+    // Core emits per-instruction validation for every RWX instruction, including
+    // instructions crossing into an RWX page. Keep writes fault-free; explicit
+    // flushes, protection changes and unmaps still invalidate translations.
+    return;
+  }
   ProtectRWXIntervalsInternal(Address, Size, false);
 }
 
