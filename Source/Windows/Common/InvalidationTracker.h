@@ -64,6 +64,7 @@ private:
   FEXCore::Context::Context& CTX;
   const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads;
   bool SMCDetectionDisabled {false};                    // Protected by IntervalsLock
+  bool ValidateRWXInstructions {false};                 // Immutable after construction
   bool DEPDisabled {false};                             // Protected by IntervalsLock
   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
 

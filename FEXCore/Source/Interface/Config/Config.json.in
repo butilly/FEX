@@ -561,6 +561,14 @@
       }
     },
     "Hacks": {
+      "SMCRWXFull": {
+        "Type": "bool",
+        "Default": "false",
+        "AffectsCodeGen": "true",
+        "Desc": [
+          "Validate instructions in writable executable memory instead of write-protecting it on Windows."
+        ]
+      },
       "SMCChecks": {
         "Type": "uint8",
         "Default": "FEXCore::Config::CONFIG_SMC_MTRACK",

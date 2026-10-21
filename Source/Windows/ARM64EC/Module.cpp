@@ -655,6 +655,14 @@ NTSTATUS ProcessInit() {
 
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
 
+  if (AppConfigName == "FarFarWest-Win64-Shipping.exe") {
+    // The game's RWX image section contains a frequently-written location on a
+    // translated code page. Retain SMC correctness without a page-fault storm.
+    // Set this before InitCore so the disk-cache codegen key includes the mode.
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_SMCRWXFULL, "1");
+    LogMan::Msg::IFmt("Far Far West: validating RWX instructions without page write traps");
+  }
+
   FEXCore::Profiler::Init("", "");
 
   SignalDelegator = fextl::make_unique<FEX::DummyHandlers::DummySignalDelegator>();
