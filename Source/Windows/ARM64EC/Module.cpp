@@ -51,6 +51,7 @@ $end_info$
 #include "Windows/Common/SHMStats.h"
 
 #include <cstdint>
+#include <atomic>
 #include <cstdio>
 #include <type_traits>
 #include <mutex>
@@ -150,6 +151,10 @@ std::optional<FEX::Windows::InvalidationTracker> InvalidationTracker;
 std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
 std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
+
+// Container-local diagnostic: never dereference guest pointers in the exception handler.
+std::atomic<uint64_t> HostPolicyDiagnosticBase {};
+std::atomic_flag HostPolicyDiagnosticCaptured = ATOMIC_FLAG_INIT;
 
 std::recursive_mutex ThreadCreationMutex;
 // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
@@ -352,9 +357,16 @@ void HandleImageMap(uint64_t Address, bool MainImage = false) {
   fextl::string ModuleName = fextl::string {FEX::Windows::BaseName(ModulePath)};
   InvalidationTracker->HandleImageMap(ModuleName, Address);
   ImageTracker->HandleImageMap(ModulePath, Address, MainImage);
+  if (AppConfigName == "Probably Stolen.exe" && ModuleName == "hostpolicy.dll") {
+    HostPolicyDiagnosticBase.store(Address, std::memory_order_relaxed);
+  }
 }
 
 void HandleImageUnmap(uint64_t Address, uint64_t Size) {
+  auto Base = HostPolicyDiagnosticBase.load(std::memory_order_relaxed);
+  if (Base >= Address && Base - Address < Size) {
+    HostPolicyDiagnosticBase.compare_exchange_strong(Base, 0, std::memory_order_relaxed);
+  }
   ImageTracker->HandleImageUnmap(Address, Size);
 }
 } // namespace
@@ -542,6 +554,52 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   return ECContext;
 }
 
+static void LogHostPolicyFirstFault(const EXCEPTION_RECORD& Rec, const ARM64_NT_CONTEXT& Host,
+                                    const ARM64_NT_CONTEXT& Guest) {
+  const auto Base = HostPolicyDiagnosticBase.load(std::memory_order_relaxed);
+  if (!Base || Guest.Pc - Base != 0x1DACF || Rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+      HostPolicyDiagnosticCaptured.test_and_set(std::memory_order_relaxed)) {
+    return;
+  }
+
+  // The uploaded .NET host faults at MOVUPS xmm0,[rax] in vector<string> relocation.
+  // Use kernel-checked reads so even corrupt/unmapped pointers cannot fault here.
+  uint8_t Opcode[3] {};
+  SIZE_T Read {};
+  auto Status = NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<const void*>(Guest.Pc), Opcode, sizeof(Opcode), &Read);
+  if (Status != STATUS_SUCCESS || Read != sizeof(Opcode) || Opcode[0] != 0x0f || Opcode[1] != 0x10 || Opcode[2] != 0x00) {
+    LogMan::Msg::IFmt("GN-FEX-HP v1 instruction mismatch, status={:X} bytes={}", static_cast<uint32_t>(Status), Read);
+    return;
+  }
+
+  LogMan::Msg::IFmt("GN-FEX-HP v1 first fault hostpc={:X} rip={:X} base={:X} access={} address={:X}", Host.Pc, Guest.Pc, Base,
+                   Rec.NumberParameters >= 2 ? Rec.ExceptionInformation[0] : ~uint64_t {},
+                   Rec.NumberParameters >= 2 ? Rec.ExceptionInformation[1] : ~uint64_t {});
+  // StoreStateToPackedECContext defines this mapping; Wine's ARM64 debugger labels are not x64 names.
+  LogMan::Msg::IFmt("GN-FEX-HP RAX={:X} RCX={:X} RDX={:X} RBX={:X}", Guest.X8, Guest.X0, Guest.X1, Guest.X27);
+  LogMan::Msg::IFmt("GN-FEX-HP RSP={:X} RBP={:X} RSI={:X} RDI={:X}", Guest.Sp, Guest.Fp, Guest.X25, Guest.X26);
+  LogMan::Msg::IFmt("GN-FEX-HP R8={:X} R9={:X} R10={:X} R11={:X}", Guest.X2, Guest.X3, Guest.X4, Guest.X5);
+  LogMan::Msg::IFmt("GN-FEX-HP R12={:X} R13={:X} R14={:X} R15={:X}", Guest.X19, Guest.X20, Guest.X21, Guest.X22);
+
+  uint64_t Vector[3] {};
+  Status = NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<const void*>(Base + 0x5B0F0), Vector, sizeof(Vector), &Read);
+  if (Status == STATUS_SUCCESS && Read == sizeof(Vector)) {
+    LogMan::Msg::IFmt("GN-FEX-HP vector={:X} begin={:X} end={:X} capacity_end={:X} rbx_matches={}",
+                     Base + 0x5B0F0, Vector[0], Vector[1], Vector[2], Guest.X27 == Base + 0x5B0F0);
+  } else {
+    LogMan::Msg::IFmt("GN-FEX-HP vector unreadable status={:X} bytes={}", static_cast<uint32_t>(Status), Read);
+  }
+
+  uint32_t HostInstruction {};
+  Status = NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<const void*>(Host.Pc), &HostInstruction, sizeof(HostInstruction), &Read);
+  if (Status == STATUS_SUCCESS && Read == sizeof(HostInstruction)) {
+    LogMan::Msg::IFmt("GN-FEX-HP arm64_instruction={:08X} cpsr={:X}", HostInstruction, Host.Cpsr);
+  }
+  for (size_t i = 0; i < 31; ++i) {
+    LogMan::Msg::IFmt("GN-FEX-HP native X{}={:X}", i, Host.X[i]);
+  }
+}
+
 static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
   auto* Thread = GetCPUArea().ThreadState();
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
@@ -552,6 +610,7 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
   }
   ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
   LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, GuestContext.Pc);
+  LogHostPolicyFirstFault(Rec, Context, GuestContext);
 
   // X64 Windows always clears TF, DF and AF when handling an exception, restoring after.
   // Current ARM64EC windows can only restore NZCV+SS when returning from an exception and other flags are left untouched from the handler context.
@@ -649,7 +708,13 @@ NTSTATUS ProcessInit() {
   AppConfigName = FEX::Windows::BaseName(ExecutablePath);
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
+  if (AppConfigName == "Probably Stolen.exe") {
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_SILENTLOG, "0");
+  }
   FEX::Windows::Logging::Init();
+  if (AppConfigName == "Probably Stolen.exe") {
+    LogMan::Msg::IFmt("GN-FEX-HP v1 armed: first hostpolicy relocation fault only; execution unchanged");
+  }
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, AppConfigName);
 
