@@ -245,7 +245,7 @@ int main(int argc, char** argv, char** const envp) {
   bool SupportsAVX = false;
   FEXCore::Core::CPUState State;
 
-  auto HostFeatures = FEX::FetchHostFeatures();
+  auto HostFeatures = FEX::FetchHostFeatures(Loader.Is64BitMode());
   auto CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
 
 #ifndef _WIN32
@@ -264,7 +264,7 @@ int main(int argc, char** argv, char** const envp) {
   bool TestUnsupported = (!SupportsAVX && Loader.RequiresAVX()) || (!HostFeatures.SupportsRAND && Loader.RequiresRAND()) ||
                          (!HostFeatures.SupportsSHA && Loader.RequiresSHA()) || (!HostFeatures.SupportsCLZERO && Loader.RequiresCLZERO()) ||
                          (!HostFeatures.SupportsAES256 && Loader.RequiresAES256()) || (!HostFeatures.SupportsAFP && Loader.RequiresAFP());
-
+  TestUnsupported |= !HostFeatures.SupportsBF16 && Loader.RequiresAVXNEConvert();
 
   bool IsHostRunner = false;
 #if !defined(VIXL_SIMULATOR) && defined(ARCHITECTURE_x86_64)
@@ -288,6 +288,8 @@ int main(int argc, char** argv, char** const envp) {
   const bool SupportsCLFLOPT = Feature.Feat_clflopt;
   const bool SupportsFSGSBase = Feature.Feat_fsgsbase;
   const bool SupportsAVXVNNI = Feature.Feat_avx_vnni;
+  const bool SupportsSerialize = Feature.Feat_serialize;
+  const bool SupportsAVXNEConvert = Feature.Feat_avx_ne_convert;
 
   TestUnsupported |=
     (!Supports3DNow && Loader.Requires3DNow()) || (!SupportsSSE4A && Loader.RequiresSSE4A()) || (!SupportsBMI1 && Loader.RequiresBMI1()) ||
@@ -297,6 +299,8 @@ int main(int argc, char** argv, char** const envp) {
     (!SupportsADX && Loader.RequiresADX()) || (!SupportsXSAVE && Loader.RequiresXSAVE()) || (!SupportsRDPID && Loader.RequiresRDPID()) ||
     (!SupportsCLFLOPT && Loader.RequiresCLFLOPT()) || (!SupportsFSGSBase && Loader.RequiresFSGSBase()) || Loader.RequiresEMMI();
   TestUnsupported |= !SupportsAVXVNNI && Loader.RequiresAVXVNNI();
+  TestUnsupported |= !SupportsSerialize && Loader.RequiresSerialize();
+  TestUnsupported |= !SupportsAVXNEConvert && Loader.RequiresAVXNEConvert();
 #endif
 
 #ifdef _WIN32

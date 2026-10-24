@@ -46,34 +46,9 @@ $end_info$
 #endif
 
 namespace {
-struct DivRem {
-  uint64_t Quotient;
-  uint64_t Remainder;
-};
-
-static struct DivRem LUDIV(uint64_t SrcHigh, uint64_t SrcLow, uint64_t Divisor) {
-  __uint128_t Source = (static_cast<__uint128_t>(SrcHigh) << 64) | SrcLow;
-
-  return {
-    .Quotient = (uint64_t)(Source / Divisor),
-    .Remainder = (uint64_t)(Source % Divisor),
-  };
-}
-
-static struct DivRem
-LDIV(uint64_t SrcHigh, uint64_t SrcLow, int64_t Divisor) {
-  __int128_t Source = (static_cast<__uint128_t>(SrcHigh) << 64) | SrcLow;
-
-  return {
-    .Quotient = (uint64_t)(Source / Divisor),
-    .Remainder = (uint64_t)(Source % Divisor),
-  };
-}
-
 #ifndef _WIN32
 
-static std::optional<uint64_t>
-RDRANDFallback(uint64_t Reseed) {
+static std::optional<uint64_t> RDRANDFallback(uint64_t Reseed) {
   uint64_t Value {};
   FHU::Syscalls::getrandom(&Value, sizeof(Value), 0);
   return Value;
@@ -87,8 +62,7 @@ RDRANDFallback(uint64_t Reseed) {
 
 // Reference implementation by Sebastiano Vigna, public domain (CC0)
 // https://prng.di.unimi.it/splitmix64.c
-static std::atomic<uint64_t>
-  RNGState {static_cast<uint64_t>(__builtin_readcyclecounter())};
+static std::atomic<uint64_t> RNGState {static_cast<uint64_t>(__builtin_readcyclecounter())};
 
 static std::optional<uint64_t> RDRANDFallback(uint64_t Reseed) {
   const uint64_t State = RNGState.load(std::memory_order_relaxed) + 0x9E3779B97F4A7C15ULL;
@@ -697,8 +671,6 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
       Ptrs.SyscallHandlerFunc = PMF.GetVTableEntry(CTX->SyscallHandler);
     }
     Ptrs.ExitFunctionLink = reinterpret_cast<uintptr_t>(&Arm64JITCore::ExitFunctionLink);
-    Ptrs.LUDIV = reinterpret_cast<uint64_t>(LUDIV);
-    Ptrs.LDIV = reinterpret_cast<uint64_t>(LDIV);
     Ptrs.RDRANDFallback = reinterpret_cast<uint64_t>(RDRANDFallback);
   }
 
