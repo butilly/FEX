@@ -100,9 +100,9 @@ NTSTATUS NtRaiseExceptionNative(EXCEPTION_RECORD*, ARM64_NT_CONTEXT*, BOOL);
 static fextl::string AppConfigName {};
 // One bounded guest-instruction capture for the startup diagnostic. Resolve
 // native entry points during initialization, not while handling the exception.
-static NTSTATUS(WINAPI* DiagnosticReadMemory)(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
-static int(__cdecl* DiagnosticOutput)(const char*);
-static std::atomic<bool> DiagnosticCaptured {false};
+alignas(16) static NTSTATUS(WINAPI* DiagnosticReadMemory)(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
+alignas(16) static int(__cdecl* DiagnosticOutput)(const char*);
+alignas(16) static std::atomic<uint64_t> DiagnosticCaptured {0};
 
 [[noreturn]]
 void JumpSetStack(uintptr_t PC, uintptr_t SP);
@@ -570,24 +570,23 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
   BOOL FirstChance = TRUE;
   EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, Rec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
   if (GuestRec.ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && DiagnosticReadMemory && DiagnosticOutput &&
-      !DiagnosticCaptured.exchange(true, std::memory_order_relaxed)) {
+      !DiagnosticCaptured.exchange(1, std::memory_order_relaxed)) {
     // Never dereference the guest PC: an unreadable address must not cause a
     // second exception in the diagnostic. Fifteen bytes cover one x86 opcode.
     uint8_t Bytes[15] {};
     SIZE_T BytesRead {};
     const auto Status = DiagnosticReadMemory(NtCurrentProcess(), reinterpret_cast<const void*>(GuestContext.Pc), Bytes, sizeof(Bytes), &BytesRead);
     char Hex[sizeof(Bytes) * 3 + 1] {};
-    constexpr char Digits[] = "0123456789abcdef";
+    const auto HexDigit = [](uint8_t Value) -> char { return Value < 10 ? '0' + Value : 'a' + Value - 10; };
     const auto Count = std::min<size_t>(BytesRead, sizeof(Bytes));
     for (size_t i = 0; i < Count; ++i) {
-      Hex[i * 3] = Digits[Bytes[i] >> 4];
-      Hex[i * 3 + 1] = Digits[Bytes[i] & 15];
+      Hex[i * 3] = HexDigit(Bytes[i] >> 4);
+      Hex[i * 3 + 1] = HexDigit(Bytes[i] & 15);
       Hex[i * 3 + 2] = ' ';
     }
-    char Message[256] {};
-    snprintf(Message, sizeof(Message), "FEX guest-illegal diagnostic: rip=%llx read_status=%08lx bytes=%zu [%s]\n",
-             static_cast<unsigned long long>(GuestContext.Pc), static_cast<unsigned long>(Status), Count, Hex);
-    DiagnosticOutput(Message);
+    const auto Message = fextl::fmt::format("FEX guest-illegal diagnostic: rip={:x} read_status={:08x} bytes={} [{}]\n",
+                                           GuestContext.Pc, static_cast<uint32_t>(Status), Count, Hex);
+    DiagnosticOutput(Message.c_str());
   }
   if (GuestRec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
     GuestContext.Cpsr &= ~(1 << 21); // PSTATE.SS
