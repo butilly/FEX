@@ -13,6 +13,23 @@ namespace {
 void (*WineDbgOut)(const char* Message);
 FILE* LogFile;
 
+// Startup diagnostics must not allocate or use the CRT before it is initialized.
+static void EarlyAssertHandler(const char* Message) {
+  if (WineDbgOut) {
+    WineDbgOut("FEX early assertion: ");
+    WineDbgOut(Message);
+    WineDbgOut("\n");
+  }
+}
+
+static void EarlyMsgHandler(LogMan::DebugLevels, const char* Message) {
+  if (WineDbgOut) {
+    WineDbgOut("FEX early message: ");
+    WineDbgOut(Message);
+    WineDbgOut("\n");
+  }
+}
+
 static void MsgHandler(LogMan::DebugLevels Level, const char* Message) {
   const auto Output = fextl::fmt::format("{} {:X} {}\n", LogMan::DebugLevelStr(Level), GetCurrentThreadId(), Message);
   if (WineDbgOut) {
@@ -39,6 +56,20 @@ void UnimplementedLog(const char* Func) {
 }
 } // namespace FEX::Windows::Logging
 namespace FEX::Windows::Logging {
+void InitEarly() {
+  WineDbgOut = reinterpret_cast<decltype(WineDbgOut)>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_dbg_output"));
+  if (WineDbgOut) {
+    LogMan::Throw::InstallHandler(EarlyAssertHandler);
+    LogMan::Msg::InstallHandler(EarlyMsgHandler);
+  }
+}
+
+void StartupTrace(const char* Message) {
+  if (WineDbgOut) {
+    WineDbgOut(Message);
+  }
+}
+
 void Init() {
   FEX_CONFIG_OPT(SilentLog, SILENTLOG);
   if (SilentLog()) {
