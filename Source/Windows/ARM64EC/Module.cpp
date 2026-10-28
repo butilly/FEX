@@ -639,22 +639,32 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
 }
 
 NTSTATUS ProcessInit() {
+  FEX::Windows::Logging::InitEarly();
+  FEX::Windows::Logging::StartupTrace("FEX startup: InitSyscalls\n");
   if (!InitSyscalls()) {
+    FEX::Windows::Logging::StartupTrace("FEX startup: InitSyscalls unsupported\n");
     return STATUS_NOT_SUPPORTED;
   }
 
+  FEX::Windows::Logging::StartupTrace("FEX startup: InitCRTProcess\n");
   FEX::Windows::InitCRTProcess();
+  FEX::Windows::Logging::StartupTrace("FEX startup: SetupThreadHandlers\n");
   FEX::Windows::SetupThreadHandlers();
+  FEX::Windows::Logging::StartupTrace("FEX startup: GetExecutableFilePath\n");
   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
   AppConfigName = FEX::Windows::BaseName(ExecutablePath);
+  FEX::Windows::Logging::StartupTrace("FEX startup: LoadConfig\n");
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
+  FEX::Windows::Logging::StartupTrace("FEX startup: ReloadMetaLayer\n");
   FEXCore::Config::ReloadMetaLayer();
+  FEX::Windows::Logging::StartupTrace("FEX startup: LoggingInit\n");
   FEX::Windows::Logging::Init();
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, AppConfigName);
 
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
 
+  FEX::Windows::Logging::StartupTrace("FEX startup: ProfilerAndHandlers\n");
   FEXCore::Profiler::Init("", "");
 
   SignalDelegator = fextl::make_unique<FEX::DummyHandlers::DummySignalDelegator>();
@@ -664,32 +674,40 @@ NTSTATUS ProcessInit() {
   const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
   OvercommitTracker.emplace(IsWine);
 
+  FEX::Windows::Logging::StartupTrace("FEX startup: EnvironmentAndAllocator\n");
   FEX::Windows::SetupEnvironmentVariableValues(NtDll);
 
   FEX::Windows::Allocator::SetupHooks(NtDll);
+  FEX::Windows::Logging::StartupTrace("FEX startup: UnixLib\n");
   FEX::Windows::UnixLib::Init(NtDll);
   if (FEX::Windows::UnixLib::Available()) {
     FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
   }
 
   {
+    FEX::Windows::Logging::StartupTrace("FEX startup: FetchHostFeatures\n");
     auto HostFeatures =
       FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Arm64ec, FEX::Windows::UnixLib::GetPID());
+    FEX::Windows::Logging::StartupTrace("FEX startup: CreateNewContext\n");
     CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
   }
 
   CTX->SetSignalDelegator(SignalDelegator.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
+  FEX::Windows::Logging::StartupTrace("FEX startup: InitCore\n");
   CTX->InitCore();
   Exception::HandlerConfig.emplace(*CTX);
   InvalidationTracker.emplace(*CTX, Threads);
   ImageTracker.emplace(*CTX, false);
 
   auto MainModule = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress;
+  FEX::Windows::Logging::StartupTrace("FEX startup: MapMainImage\n");
   HandleImageMap(reinterpret_cast<uint64_t>(MainModule), true);
 
+  FEX::Windows::Logging::StartupTrace("FEX startup: MapNtdll\n");
   HandleImageMap(NtDllBase);
 
+  FEX::Windows::Logging::StartupTrace("FEX startup: CPUFeaturesAndReturnStub\n");
   CPUFeatures.emplace(*CTX);
 
   X64ReturnInstr = ::VirtualAlloc(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, MEM_COMMIT | MEM_TOP_DOWN, PAGE_EXECUTE_READWRITE);
@@ -713,6 +731,7 @@ NTSTATUS ProcessInit() {
     std::this_thread::sleep_for(std::chrono::seconds(StartupSleep()));
   }
 
+  FEX::Windows::Logging::StartupTrace("FEX startup: ProcessInit complete\n");
   return STATUS_SUCCESS;
 }
 
