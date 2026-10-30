@@ -376,6 +376,7 @@ static void OverrideFeatures(FEXCore::HostFeatures* Features, uint64_t ForceSVEW
   ENABLE_DISABLE_OPTION(SupportsMOPS, MOPS, MOPS);
   ENABLE_DISABLE_OPTION(SupportsI8MM, I8MM, I8MM);
   ENABLE_DISABLE_OPTION(SupportsDotProd, DOTPROD, DOTPROD);
+  ENABLE_DISABLE_OPTION(SupportsBF16, BF16, BF16);
   GET_SINGLE_OPTION(Crypto, CRYPTO);
 
 #undef ENABLE_DISABLE_OPTION
@@ -508,6 +509,7 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   HostFeatures.SupportsWFXT = Features.Supports(CPUFeatures::Feature::WFxt);
   HostFeatures.SupportsI8MM = Features.Supports(CPUFeatures::Feature::I8MM);
   HostFeatures.SupportsDotProd = Features.Supports(CPUFeatures::Feature::DotProd);
+  HostFeatures.SupportsBF16 = Features.Supports(CPUFeatures::Feature::BF16);
 
 #ifdef VIXL_SIMULATOR
   // Hardcode enable SVE with 256-bit wide registers.
@@ -599,7 +601,7 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   OverrideFeatures(&HostFeatures, ForceSVEWidth());
 }
 
-FEXCore::HostFeatures FetchHostFeatures() {
+FEXCore::HostFeatures FetchHostFeatures(bool Is64BitMode) {
   FEX_CONFIG_OPT(CPUFeatureRegisters, CPUFEATUREREGISTERS);
 
   CPUFeatures Features {};
@@ -632,7 +634,10 @@ FEXCore::HostFeatures FetchHostFeatures() {
   FetchHostFeatures(Features, HostFeatures, true, CTR, MIDR);
 
   HostFeatures.SupportsCPUIndexInTPIDRRO = false;
-  HostFeatures.HostType = FEXCore::HostFeatures::HostTypeEnum::Linux;
+  HostFeatures.ProcessFeatures.HostType = FEXCore::HostFeatures::HostTypeEnum::Linux;
+  HostFeatures.ProcessFeatures.Is64BitMode = Is64BitMode;
+  // Fault free syncronous faults unsupported on Linux for now.
+  HostFeatures.ProcessFeatures.SupportsFaultFreeSynchronousFaults = false;
   HostFeatures.ProcessPID = ::getpid();
   return HostFeatures;
 }

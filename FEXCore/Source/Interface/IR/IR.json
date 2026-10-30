@@ -530,6 +530,7 @@
       },
 
       "SSA = LoadMem RegisterClass:$Class, OpSize:#Size, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale": {
+        "HasSideEffects": true,
         "Inline": ["", "Mem"],
         "DestSize": "Size"
       },
@@ -575,6 +576,7 @@
       },
 
       "SSA = LoadMemTSO RegisterClass:$Class, OpSize:#Size, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale": {
+        "HasSideEffects": true,
         "Desc": ["Does a x86 TSO compatible load from memory. Offset must be Invalid()."
                 ],
         "Inline": ["", "Memtso"],
@@ -590,6 +592,7 @@
       },
 
       "FPR = VLoadVectorMasked OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Mask, GPR:$Addr, GPR:$Offset, MemOffsetType:$OffsetType, u8:$OffsetScale": {
+        "HasSideEffects": true,
         "Desc": ["Does a masked load similar to VPMASKMOV/VMASKMOV where the upper bit of each element",
                  "determines whether or not that element will be loaded from memory"],
         "ImplicitFlagClobber": true,
@@ -604,11 +607,13 @@
         "DestSize": "RegisterSize",
         "ElementSize": "ElementSize"
       },
-      "FPR = VLoadVectorGatherMasked OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Incoming, FPR:$Mask, GPR:$AddrBase, FPR:$VectorIndexLow, FPR:$VectorIndexHigh, OpSize:$VectorIndexElementSize, u8:$OffsetScale, u8:$DataElementOffsetStart, u8:$IndexElementOffsetStart, OpSize:$AddrSize": {
+      "FPR = VLoadVectorGatherMasked OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Incoming, FPR:$Mask, GPR:$AddrBase, FPR:$VectorIndexLow, FPR:$VectorIndexHigh, OpSize:$VectorIndexElementSize, u8:$OffsetScale, u8:$DataElementOffsetStart, u8:$IndexElementOffsetStart, OpSize:$AddrSize, i1:$MaskAllOnes{false}": {
+        "HasSideEffects": true,
         "Desc": [
           "Does a masked load similar to VPGATHERD* where the upper bit of each element",
           "determines whether or not that element will be loaded from memory.",
-          "Most of VSIB encoding is passed directly through to the IR operation."
+          "Most of VSIB encoding is passed directly through to the IR operation.",
+          "MaskAllOnes is set when every mask element is provably all ones."
         ],
         "TiedSource": 0,
         "ImplicitFlagClobber": true,
@@ -618,12 +623,14 @@
           "$VectorIndexElementSize == OpSize::i32Bit || $VectorIndexElementSize == OpSize::i64Bit"
         ]
       },
-      "FPR = VLoadVectorGatherMaskedQPS OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Incoming, FPR:$MaskReg, GPR:$AddrBase, FPR:$VectorIndexLow, FPR:$VectorIndexHigh, u8:$OffsetScale, OpSize:$AddrSize": {
+      "FPR = VLoadVectorGatherMaskedQPS OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$Incoming, FPR:$MaskReg, GPR:$AddrBase, FPR:$VectorIndexLow, FPR:$VectorIndexHigh, u8:$OffsetScale, OpSize:$AddrSize, i1:$MaskAllOnes{false}": {
+        "HasSideEffects": true,
         "Desc": [
           "Does a masked load similar to VPGATHERQPS where the upper bit of each element",
           "determines whether or not that element will be loaded from memory.",
           "Most of VSIB encoding is passed directly through to the IR operation.",
-          "Only supports the case of 32-bit data element sizes from 64-bit addresses"
+          "Only supports the case of 32-bit data element sizes from 64-bit addresses",
+          "MaskAllOnes is set when every mask element is provably all ones."
         ],
         "TiedSource": 0,
         "ImplicitFlagClobber": true,
@@ -635,6 +642,7 @@
         ]
       },
       "FPR = VLoadVectorElement OpSize:#RegisterSize, OpSize:#ElementSize, FPR:$DstSrc, u8:$Index, GPR:$Addr": {
+        "HasSideEffects": true,
         "Desc": ["Does a memory load to a single element of a vector.",
                  "Leaves the rest of the vector's data intact.",
                  "Matches arm64 ld1 semantics"],
@@ -774,6 +782,7 @@
         ]
       },
       "FPR = VLoadNonTemporal OpSize:#RegisterSize, GPR:$Addr, i8:$Offset": {
+        "HasSideEffects": true,
         "Desc": ["Does a non-temporal memory load of a vector.",
                  "Matches arm64 SVE ldnt1b semantics.",
                  "Specifically weak-memory model ordered to match x86 non-temporal stores."
@@ -1861,7 +1870,7 @@
         "DestSize": "RegisterSize"
       },
 
-      "FPR = VectorImm OpSize:#RegisterSize, OpSize:#ElementSize, u8:$Immediate, u8:$ShiftAmount{0}": {
+      "FPR = VectorImm OpSize:#RegisterSize, OpSize:#ElementSize, u8:$Immediate, u8:$ShiftAmount{0}, i1:$Do64BitExpansion{false}": {
         "Desc": ["Generates a vector with each element containg the immediate zexted"
                 ],
         "DestSize": "RegisterSize",
@@ -2755,6 +2764,28 @@
         ],
         "DestSize": "RegisterSize",
         "ElementSize": "ElementSize >> 1",
+        "EmitValidation": [
+          "RegisterSize != FEXCore::IR::OpSize::i256Bit && \"What does 256-bit mean in this context?\""
+        ]
+      },
+      "FPR = VBFCVTN OpSize:#RegisterSize, FPR:$Vector": {
+        "Desc": [
+          "Converts fp32 to bf16."
+        ],
+        "DestSize": "RegisterSize",
+        "ElementSize": "FEXCore::IR::OpSize::i16Bit",
+        "EmitValidation": [
+          "RegisterSize != FEXCore::IR::OpSize::i256Bit && \"What does 256-bit mean in this context?\""
+        ]
+      },
+      "FPR = VBFCVTN2 OpSize:#RegisterSize, FPR:$VectorLower, FPR:$VectorUpper": {
+        "TiedSource": 0,
+        "Desc": [
+          "Converts fp32 to bf16 and inserting in to the high bits.",
+          "Bottom half is untouched"
+        ],
+        "DestSize": "RegisterSize",
+        "ElementSize": "FEXCore::IR::OpSize::i16Bit",
         "EmitValidation": [
           "RegisterSize != FEXCore::IR::OpSize::i256Bit && \"What does 256-bit mean in this context?\""
         ]
