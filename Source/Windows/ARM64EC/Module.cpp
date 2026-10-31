@@ -51,6 +51,8 @@ $end_info$
 #include "Windows/Common/SHMStats.h"
 
 #include <cstdint>
+#include <atomic>
+#include <array>
 #include <cstdio>
 #include <type_traits>
 #include <mutex>
@@ -542,6 +544,64 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   return ECContext;
 }
 
+// Diagnostic only: no guest memory dereferences and no changes to exception delivery.
+// The try-lock also suppresses recursive logging if a diagnostic operation faults.
+static void LogGuestFault(const EXCEPTION_RECORD& Rec, const ARM64_NT_CONTEXT* PackedContext) {
+  if (AppConfigName != "fm.exe" ||
+      (Rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION && Rec.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION)) {
+    return;
+  }
+  static std::atomic_flag Busy = ATOMIC_FLAG_INIT;
+  if (Busy.test_and_set(std::memory_order_acquire)) {
+    return;
+  }
+  struct Unlock {
+    std::atomic_flag& Flag;
+    ~Unlock() { Flag.clear(std::memory_order_release); }
+  } Guard {Busy};
+  struct Site { uintptr_t Address; DWORD Code; };
+  static std::array<Site, 24> Seen {};
+  static size_t Count {};
+  const auto Address = reinterpret_cast<uintptr_t>(Rec.ExceptionAddress);
+  for (size_t i = 0; i < Count; ++i) {
+    if (Seen[i].Address == Address && Seen[i].Code == Rec.ExceptionCode) {
+      return;
+    }
+  }
+  if (Count == Seen.size()) {
+    return;
+  }
+  Seen[Count++] = {Address, Rec.ExceptionCode};
+
+  MEMORY_BASIC_INFORMATION Info {};
+  const auto QueryStatus = NtQueryVirtualMemory(NtCurrentProcess(), Rec.ExceptionAddress, MemoryBasicInformation, &Info, sizeof(Info), nullptr);
+  std::array<uint8_t, 15> Bytes {};
+  SIZE_T Read {};
+  const auto ReadStatus = NtReadVirtualMemory(NtCurrentProcess(), Rec.ExceptionAddress, Bytes.data(), Bytes.size(), &Read);
+  std::array<char, 46> Hex {};
+  constexpr char Digits[] = "0123456789abcdef";
+  for (size_t i = 0; i < Read && i < Bytes.size(); ++i) {
+    Hex[i * 3] = Digits[Bytes[i] >> 4];
+    Hex[i * 3 + 1] = Digits[Bytes[i] & 15];
+    Hex[i * 3 + 2] = ' ';
+  }
+  LogMan::Msg::IFmt("GN-FEX-FAULT-v1 site={} code={:X} pc={:X} translated={} params={} access={:X} target={:X}",
+                   Count, Rec.ExceptionCode, Address, PackedContext != nullptr, Rec.NumberParameters,
+                   Rec.NumberParameters > 0 ? Rec.ExceptionInformation[0] : 0,
+                   Rec.NumberParameters > 1 ? Rec.ExceptionInformation[1] : 0);
+  LogMan::Msg::IFmt("GN-FEX-FAULT-v1 pc={:X} query={:X} allocation={:X} region={:X} size={:X} state={:X} protect={:X} read={:X} count={} bytes={}",
+                   Address, static_cast<uint32_t>(QueryStatus), reinterpret_cast<uintptr_t>(Info.AllocationBase),
+                   reinterpret_cast<uintptr_t>(Info.BaseAddress), Info.RegionSize, Info.State, Info.Protect,
+                   static_cast<uint32_t>(ReadStatus), Read, Hex.data());
+  if (PackedContext) {
+    const auto& C = *PackedContext;
+    LogMan::Msg::IFmt("GN-FEX-FAULT-v1 pc={:X} rax={:X} rcx={:X} rdx={:X} rbx={:X} rsp={:X} rbp={:X} rsi={:X} rdi={:X}",
+                     Address, C.X8, C.X0, C.X1, C.X27, C.Sp, C.Fp, C.X25, C.X26);
+    LogMan::Msg::IFmt("GN-FEX-FAULT-v1 pc={:X} r8={:X} r9={:X} r10={:X} r11={:X} r12={:X} r13={:X} r14={:X} r15={:X}",
+                     Address, C.X2, C.X3, C.X4, C.X5, C.X19, C.X20, C.X21, C.X22);
+  }
+}
+
 static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
   auto* Thread = GetCPUArea().ThreadState();
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
@@ -569,6 +629,7 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
     GuestContext.Pc -= 1;
   }
 
+  LogGuestFault(GuestRec, &GuestContext);
   NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
 }
 
@@ -649,7 +710,13 @@ NTSTATUS ProcessInit() {
   AppConfigName = FEX::Windows::BaseName(ExecutablePath);
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
+  if (AppConfigName == "fm.exe") {
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_SILENTLOG, "0");
+  }
   FEX::Windows::Logging::Init();
+  if (AppConfigName == "fm.exe") {
+    LogMan::Msg::IFmt("GN-FEX-FAULT-v1 enabled: ARM64EC, at most 24 distinct fault sites; exception handling unchanged");
+  }
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, AppConfigName);
 
@@ -789,6 +856,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
   }
 
   if (!IsJIT && !IsDispatcherAddress(NativeContext->Pc)) {
+    Exception::LogGuestFault(*Exception, nullptr);
     LogMan::Msg::DFmt("Passing through exception");
     return false;
   }
