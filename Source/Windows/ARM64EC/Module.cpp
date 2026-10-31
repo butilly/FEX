@@ -551,17 +551,18 @@ static void LogGuestFault(const EXCEPTION_RECORD& Rec, const ARM64_NT_CONTEXT* P
       (Rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION && Rec.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION)) {
     return;
   }
-  static std::atomic_flag Busy = ATOMIC_FLAG_INIT;
-  if (Busy.test_and_set(std::memory_order_acquire)) {
+  // Use a naturally aligned word for ARM64EC's atomic/global relocations.
+  alignas(16) static std::atomic<uint32_t> Busy {0};
+  if (Busy.exchange(1, std::memory_order_acquire)) {
     return;
   }
   struct Unlock {
-    std::atomic_flag& Flag;
-    ~Unlock() { Flag.clear(std::memory_order_release); }
+    std::atomic<uint32_t>& Flag;
+    ~Unlock() { Flag.store(0, std::memory_order_release); }
   } Guard {Busy};
   struct Site { uintptr_t Address; DWORD Code; };
-  static std::array<Site, 24> Seen {};
-  static size_t Count {};
+  alignas(16) static std::array<Site, 24> Seen {};
+  alignas(16) static size_t Count {};
   const auto Address = reinterpret_cast<uintptr_t>(Rec.ExceptionAddress);
   for (size_t i = 0; i < Count; ++i) {
     if (Seen[i].Address == Address && Seen[i].Code == Rec.ExceptionCode) {
@@ -579,7 +580,7 @@ static void LogGuestFault(const EXCEPTION_RECORD& Rec, const ARM64_NT_CONTEXT* P
   SIZE_T Read {};
   const auto ReadStatus = NtReadVirtualMemory(NtCurrentProcess(), Rec.ExceptionAddress, Bytes.data(), Bytes.size(), &Read);
   std::array<char, 46> Hex {};
-  constexpr char Digits[] = "0123456789abcdef";
+  alignas(16) static constexpr char Digits[] = "0123456789abcdef";
   for (size_t i = 0; i < Read && i < Bytes.size(); ++i) {
     Hex[i * 3] = Digits[Bytes[i] >> 4];
     Hex[i * 3 + 1] = Digits[Bytes[i] & 15];
