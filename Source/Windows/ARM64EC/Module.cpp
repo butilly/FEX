@@ -638,18 +638,71 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
   Exception::LoadStateFromECContext(Thread, *Context);
 }
 
+namespace {
+// Diagnostic-only Wine startup sink: no CRT, formatting or allocation is needed
+// by the stage markers. The temporary LogMan handlers are installed only after
+// CRT initialization, and removed before normal logging takes over.
+decltype(&__wine_dbg_output) StartupOutput;
+
+void StartupMessage(const char* Message) {
+  if (!StartupOutput) {
+    return;
+  }
+  char Buffer[1024];
+  size_t Position = 0;
+  for (char C : "[FEX startup] ") {
+    if (C) {
+      Buffer[Position++] = C;
+    }
+  }
+  const auto Tid = reinterpret_cast<uintptr_t>(reinterpret_cast<__TEB*>(NtCurrentTeb())->ClientId.UniqueThread);
+  for (int Shift = 28; Shift >= 0; Shift -= 4) {
+    Buffer[Position++] = "0123456789abcdef"[(Tid >> Shift) & 15];
+  }
+  Buffer[Position++] = ' ';
+  while (*Message && Position < sizeof(Buffer) - 2) {
+    Buffer[Position++] = *Message++;
+  }
+  Buffer[Position++] = '\n';
+  Buffer[Position] = 0;
+  StartupOutput(Buffer);
+}
+
+void StartupLogHandler(LogMan::DebugLevels, const char* Message) {
+  StartupMessage(Message);
+}
+} // namespace
+
 NTSTATUS ProcessInit() {
+  StartupOutput = reinterpret_cast<decltype(StartupOutput)>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_dbg_output"));
+  StartupMessage("ProcessInit: begin syscalls");
   if (!InitSyscalls()) {
+    StartupMessage("ProcessInit: unsupported syscalls");
     return STATUS_NOT_SUPPORTED;
   }
 
+  StartupMessage("ProcessInit: syscalls ready, begin CRT");
   FEX::Windows::InitCRTProcess();
+  StartupMessage("ProcessInit: CRT ready");
+  if (StartupOutput) {
+    LogMan::Throw::InstallHandler(StartupMessage);
+    LogMan::Msg::InstallHandler(StartupLogHandler);
+  }
   FEX::Windows::SetupThreadHandlers();
+  StartupMessage("ProcessInit: thread handlers ready");
   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
   AppConfigName = FEX::Windows::BaseName(ExecutablePath);
+  StartupMessage("ProcessInit: executable name ready, begin config");
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
+  StartupMessage("ProcessInit: config loaded");
   FEXCore::Config::ReloadMetaLayer();
+  StartupMessage("ProcessInit: meta layer ready");
+  if (StartupOutput) {
+    LogMan::Throw::UnInstallHandler();
+    LogMan::Msg::UnInstallHandler();
+  }
   FEX::Windows::Logging::Init();
+  StartupMessage("ProcessInit: normal logging ready");
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, AppConfigName);
 
@@ -667,7 +720,9 @@ NTSTATUS ProcessInit() {
   FEX::Windows::SetupEnvironmentVariableValues(NtDll);
 
   FEX::Windows::Allocator::SetupHooks(NtDll);
+  StartupMessage("ProcessInit: allocator hooks ready");
   FEX::Windows::UnixLib::Init(NtDll);
+  StartupMessage("ProcessInit: UnixLib ready");
   if (FEX::Windows::UnixLib::Available()) {
     FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
   }
@@ -675,20 +730,25 @@ NTSTATUS ProcessInit() {
   {
     auto HostFeatures =
       FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Arm64ec, FEX::Windows::UnixLib::GetPID());
+    StartupMessage("ProcessInit: host features ready");
     CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
+    StartupMessage("ProcessInit: context created");
   }
 
   CTX->SetSignalDelegator(SignalDelegator.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
   CTX->InitCore();
+  StartupMessage("ProcessInit: core ready");
   Exception::HandlerConfig.emplace(*CTX);
   InvalidationTracker.emplace(*CTX, Threads);
   ImageTracker.emplace(*CTX, false);
 
   auto MainModule = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress;
   HandleImageMap(reinterpret_cast<uint64_t>(MainModule), true);
+  StartupMessage("ProcessInit: main image mapped");
 
   HandleImageMap(NtDllBase);
+  StartupMessage("ProcessInit: ntdll mapped");
 
   CPUFeatures.emplace(*CTX);
 
@@ -713,6 +773,7 @@ NTSTATUS ProcessInit() {
     std::this_thread::sleep_for(std::chrono::seconds(StartupSleep()));
   }
 
+  StartupMessage("ProcessInit: complete");
   return STATUS_SUCCESS;
 }
 
