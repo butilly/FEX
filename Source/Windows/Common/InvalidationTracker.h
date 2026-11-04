@@ -17,6 +17,9 @@ class Context;
 }
 
 namespace FEX::Windows {
+namespace SMCDiagnostics {
+struct Event;
+}
 /**
  * @brief Handles SMC and regular code invalidation
  */
@@ -33,7 +36,8 @@ public:
   InvalidateContainingSectionResult InvalidateContainingSection(uint64_t Address, bool Free);
   void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free);
   void ReprotectRWXIntervals(uint64_t Address, uint64_t Size);
-  bool HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t FaultAddress);
+  bool HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t FaultAddress,
+                               SMCDiagnostics::Event* Timing = nullptr);
 
   // Unprotects any RWX intervals in the input interval and invalidates code
   // NOTE: CodeInvalidationMutex must be locked when calling this, and if true is returned, kept locked until the write ends.
@@ -46,7 +50,7 @@ private:
   void DisableSMCDetection();
   void InvalidateIntervalInternal(uint64_t Address, uint64_t Size);
   // NOTE: This assumed CodeInvalidationMutex is locked by the caller
-  void InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size);
+  void InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size, SMCDiagnostics::Event* Timing = nullptr);
 
   // NOTE: If ForWriteLocked is true then this assumes CodeInvalidationMutex is locked by the caller,
   // and any code in the range will be invalidated before protection as RWX, otherwise protects as RX if false.

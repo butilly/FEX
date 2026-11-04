@@ -37,6 +37,7 @@ $end_info$
 #include "Common/Exception.h"
 #include "Common/ImageTracker.h"
 #include "Common/InvalidationTracker.h"
+#include "Common/SMCDiagnostics.h"
 #include "Common/Threads.h"
 #include "Common/OvercommitTracker.h"
 #include "Common/TSOHandlerConfig.h"
@@ -761,8 +762,22 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
       return true;
     }
 
+    const bool MeasureSMC = AppConfigName == "SlayTheSpire.exe";
+    FEX::Windows::SMCDiagnostics::Event Timing;
+    if (MeasureSMC) {
+      Timing.Start = FEX::Windows::SMCDiagnostics::Ticks();
+    }
     std::scoped_lock Lock(ThreadCreationMutex);
-    if (InvalidationTracker && InvalidationTracker->HandleRWXAccessViolation(Thread, NativeContext->Pc, FaultAddress)) {
+    if (MeasureSMC) {
+      Timing.Stages[0] = FEX::Windows::SMCDiagnostics::Ticks() - Timing.Start;
+    }
+    if (InvalidationTracker && InvalidationTracker->HandleRWXAccessViolation(Thread, NativeContext->Pc, FaultAddress,
+                                                                           MeasureSMC ? &Timing : nullptr)) {
+      if (MeasureSMC) {
+        const auto End = FEX::Windows::SMCDiagnostics::Ticks();
+        static FEX::Windows::SMCDiagnostics::Summary Summary;
+        Summary.Record(Timing, End);
+      }
       FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
       if (CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc) && !CTX->IsCurrentBlockSingleInst(CPUArea.ThreadState()) &&
           CTX->IsAddressInCurrentBlock(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {

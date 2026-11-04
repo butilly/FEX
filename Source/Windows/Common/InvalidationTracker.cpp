@@ -7,6 +7,7 @@
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include "InvalidationTracker.h"
+#include "SMCDiagnostics.h"
 #include <windef.h>
 #include <winternl.h>
 
@@ -216,7 +217,9 @@ void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size)
   ProtectRWXIntervalsInternal(Address, Size, false);
 }
 
-bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc, uint64_t FaultAddress) {
+bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc, uint64_t FaultAddress,
+                                                 SMCDiagnostics::Event* Timing) {
+  const auto LookupStart = Timing ? SMCDiagnostics::Ticks() : 0;
   const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
     std::shared_lock Lock(IntervalsLock);
     if (!RWXIntervals.Query(Address).Enclosed) {
@@ -225,18 +228,30 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
     return {true, GetUntrapProt(Address)};
   }(FaultAddress);
 
+  const auto LookupEnd = Timing ? SMCDiagnostics::Ticks() : 0;
+  if (Timing) {
+    Timing->Stages[1] = LookupEnd - LookupStart;
+  }
+
   if (NeedsInvalidate) {
     // IntervalsLock cannot be held during invalidation
     {
       std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+      if (Timing) {
+        Timing->Stages[2] = SMCDiagnostics::Ticks() - LookupEnd;
+      }
 
-      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE, Timing);
 
       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
       ULONG TmpProt;
       void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
       SIZE_T TmpSize = 1;
+      const auto ProtectStart = Timing ? SMCDiagnostics::Ticks() : 0;
       NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
+      if (Timing) {
+        Timing->Stages[5] = SMCDiagnostics::Ticks() - ProtectStart;
+      }
     }
     DetectMonoBackpatcherBlock(Thread, HostPc);
     return true;
@@ -330,11 +345,17 @@ void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t 
   InvalidateIntervalInternalLocked(Address, Size);
 }
 
-void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size) {
+void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size, SMCDiagnostics::Event* Timing) {
   // NOTE: This assumes CodeInvalidationMutex is locked by the caller
+  const auto BufferStart = Timing ? SMCDiagnostics::Ticks() : 0;
   CTX.InvalidateCodeBuffersCodeRange(Address, Size);
+  const auto CacheStart = Timing ? SMCDiagnostics::Ticks() : 0;
   for (auto Thread : Threads) {
     CTX.InvalidateThreadCachedCodeRange(Thread.second, Address, Size);
+  }
+  if (Timing) {
+    Timing->Stages[3] = CacheStart - BufferStart;
+    Timing->Stages[4] = SMCDiagnostics::Ticks() - CacheStart;
   }
 }
 
