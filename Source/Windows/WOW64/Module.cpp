@@ -144,6 +144,9 @@ std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
 
 std::mutex ThreadCreationMutex;
+// Targeted, bounded diagnostics without enabling the high-volume SMC log.
+void (*ExceptionDiagnosticOutput)(const char*) {};
+std::atomic<uint64_t> ExceptionDiagnosticCount {};
 // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
 std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
 
@@ -504,6 +507,11 @@ void BTCpuProcessInit() {
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
 
+  if (ExecutableName == "DDO.exe" || ExecutableName == "ddo.exe") {
+    ExceptionDiagnosticOutput = reinterpret_cast<decltype(ExceptionDiagnosticOutput)>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_dbg_output"));
+  }
+
   FEXCore::Config::Set(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED, "0");
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "0");
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
@@ -790,6 +798,9 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   LogMan::Msg::DFmt("pc: {:X} eip: {:X} code: {:X}", Context->Pc, WowContext->Eip, Exception->ExceptionCode);
 
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+  const auto OriginalFault = Fault;
+  const auto OriginalEip = WowContext->Eip;
+  const auto OriginalFlags = WowContext->EFlags;
   BOOL FirstChance = TRUE;
   EXCEPTION_RECORD GuestException =
     FEX::Windows::HandleGuestException(Fault, *Exception, WowContext->Eip, WowContext->Eax, WowContext->Ecx, FirstChance);
@@ -797,6 +808,40 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
     WowContext->EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
   }
   // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
+
+  if (ExceptionDiagnosticOutput && ExceptionDiagnosticCount.load(std::memory_order_relaxed) < 65536) {
+    const auto Sample = ExceptionDiagnosticCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    // First 32 exceptions, then powers of two: at most 43 samples per process.
+    if (Sample <= 32 || (Sample & (Sample - 1)) == 0) {
+      const auto Emit = [](const auto& Message) { ExceptionDiagnosticOutput(Message.c_str()); };
+      const auto Tid = GetCurrentThreadId();
+      Emit(fextl::fmt::format("FEX-WOW64-DIAG n={} tid={:X} hostpc={:X} hostcode={:X} eip={:X} generated={} signal={} trap={} err={:X}\n",
+                             Sample, Tid, Context->Pc, Exception->ExceptionCode, OriginalEip,
+                             OriginalFault.FaultToTopAndGeneratedException, OriginalFault.Signal, OriginalFault.TrapNo, OriginalFault.err_code));
+      Emit(fextl::fmt::format("FEX-WOW64-DIAG n={} tid={:X} guestcode={:X} address={:X} context_eip={:X} flags={:X}->{:X} params={} p0={:X} p1={:X}\n",
+                             Sample, Tid, GuestException.ExceptionCode, reinterpret_cast<uintptr_t>(GuestException.ExceptionAddress),
+                             WowContext->Eip, OriginalFlags, WowContext->EFlags, GuestException.NumberParameters,
+                             GuestException.NumberParameters > 0 ? GuestException.ExceptionInformation[0] : 0,
+                             GuestException.NumberParameters > 1 ? GuestException.ExceptionInformation[1] : 0));
+      Emit(fextl::fmt::format("FEX-WOW64-DIAG n={} tid={:X} eax={:X} ecx={:X} edx={:X} esp={:X} dr6={:X} dr7={:X}\n",
+                             Sample, Tid, WowContext->Eax, WowContext->Ecx, WowContext->Edx, WowContext->Esp, WowContext->Dr6, WowContext->Dr7));
+
+      // Read through the OS so an unreadable guest address cannot fault here.
+      // Each word is little-endian; bytes cover EIP-4 through EIP+11.
+      const uintptr_t Start = OriginalEip >= 4 ? OriginalEip - 4 : OriginalEip;
+      uint64_t Words[2] {};
+      SIZE_T BytesRead {};
+      const auto ReadStatus = NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Start), Words, sizeof(Words), &BytesRead);
+      MEMORY_BASIC_INFORMATION Memory {};
+      const auto QueryStatus = NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(static_cast<uintptr_t>(OriginalEip)),
+                                                    MemoryBasicInformation, &Memory, sizeof(Memory), nullptr);
+      Emit(fextl::fmt::format("FEX-WOW64-DIAG n={} tid={:X} bytes_at={:X} read_status={:X} bytes={} le64={:016X},{:016X}\n",
+                             Sample, Tid, Start, static_cast<uint32_t>(ReadStatus), BytesRead, Words[0], Words[1]));
+      Emit(fextl::fmt::format("FEX-WOW64-DIAG n={} tid={:X} query_status={:X} base={:X} size={:X} state={:X} protect={:X} type={:X}\n",
+                             Sample, Tid, static_cast<uint32_t>(QueryStatus), reinterpret_cast<uintptr_t>(Memory.BaseAddress),
+                             Memory.RegionSize, Memory.State, Memory.Protect, Memory.Type));
+    }
+  }
 
   Context::UnlockJITContext();
   NtRaiseException(&GuestException, GetTLS().EntryContext(), FirstChance);
