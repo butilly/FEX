@@ -66,7 +66,14 @@ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame
           Dst.ExceptionInformation[0] = Rax;
           // Note that ExceptionAddress doesn't equal the reported context RIP here, this discrepancy expected and not having it can trigger anti-debug logic.
           return Dst;
-        default: LogMan::Msg::EFmt("Unknown interrupt: 0x{:X}", Fault.err_code >> 3); break;
+        default:
+          // An inaccessible INT imm8 gate raises #GP, not #UD. Match the
+          // Windows access-violation record and leave RIP on the instruction.
+          Dst.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+          Dst.NumberParameters = 2;
+          Dst.ExceptionInformation[0] = 0;
+          Dst.ExceptionInformation[1] = static_cast<TReg>(-1);
+          return Dst;
         }
       } else {
         Dst.ExceptionCode = EXCEPTION_PRIV_INSTRUCTION;
