@@ -729,6 +729,14 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   auto* Context = Ptrs->ContextRecord;
   auto* Exception = Ptrs->ExceptionRecord;
   auto Thread = GetTLS().ThreadState();
+  // Exceptions can arrive during process/thread initialization, before the FEX
+  // thread is published in TLS. Profiling and the JIT handlers dereference it,
+  // so let Wine dispatch these faults instead of recursively faulting here.
+  // Overcommit faults are process-wide and can still be handled at this stage.
+  if (!Thread) {
+    return Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && OvercommitTracker &&
+           OvercommitTracker->HandleAccessViolation(static_cast<uint64_t>(Exception->ExceptionInformation[1]));
+  }
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedSignalTime);
 
   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -769,7 +777,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
     }
   }
 
-  if (!Thread || !IsAddressInJit(Context->Pc)) {
+  if (!IsAddressInJit(Context->Pc)) {
     return false;
   }
 
