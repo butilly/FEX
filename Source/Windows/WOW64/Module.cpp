@@ -19,7 +19,6 @@ $end_info$
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/LogManager.h>
-#include <FEXCore/Utils/Threads.h>
 #include <FEXCore/Utils/Profiler.h>
 #include <FEXCore/Utils/SHMStats.h>
 #include <FEXCore/Utils/EnumOperators.h>
@@ -131,6 +130,7 @@ namespace BridgeInstrs {
   // These directly jumped to by the guest to make system calls
   void* Syscall {};
   void* UnixCall {};
+  void* HangCapture {};
 } // namespace BridgeInstrs
 
 fextl::unique_ptr<FEXCore::Context::Context> CTX;
@@ -148,6 +148,60 @@ std::mutex ThreadCreationMutex;
 std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
 
 decltype(__wine_unix_call_dispatcher) WineUnixCall;
+
+// Bounded, executable-specific startup-hang capture. No JIT or guest locks are
+// held by the sampler, and all formatting/output happens after resuming.
+DWORD HangCaptureTID {};
+void (*HangCaptureOutput)(const char*);
+FEX::Windows::ScopedHandle HangCaptureTarget;
+FEX::Windows::ScopedHandle HangCaptureWorker;
+
+void* CaptureStartupHang(void*) {
+  HangCaptureOutput("FEX-HANG: sampler entered through x86 bridge\n");
+  LARGE_INTEGER Delay;
+  Delay.QuadPart = -15LL * 10000000;
+  NtDelayExecution(FALSE, &Delay);
+  for (unsigned Sample = 0; Sample < 12; ++Sample) {
+    WOW64_CONTEXT Guest {};
+    Guest.ContextFlags = WOW64_CONTEXT_CONTROL | WOW64_CONTEXT_INTEGER;
+    CONTEXT Native {};
+    Native.ContextFlags = CONTEXT_CONTROL;
+    MEMORY_BASIC_INFORMATION Mapping {};
+    ULONG PreviousCount = 0;
+    NTSTATUS Status = RtlWow64SuspendThread(*HangCaptureTarget, &PreviousCount);
+    if (Status) {
+      HangCaptureOutput("FEX-HANG: target unavailable; capture stopped\n");
+      break;
+    }
+
+    // Force completion of the cooperative suspend before reading WOW64 state.
+    Status = NtGetContextThread(*HangCaptureTarget, &Native);
+    if (!Status) {
+      Status = RtlWow64GetThreadContext(*HangCaptureTarget, &Guest);
+    }
+    const auto ResumeStatus = NtResumeThread(*HangCaptureTarget, nullptr);
+    // Never allocate or log with the guest suspended: it may own CRT locks.
+    if (ResumeStatus) {
+      break;
+    }
+    // Query mappings only after resume as Wine may need its VM lock. The
+    // allocation is advisory (it can change), while EIP is the captured value.
+    if (!Status) {
+      NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(uintptr_t(Guest.Eip)), MemoryBasicInformation,
+                           &Mapping, sizeof(Mapping), nullptr);
+    }
+    const auto Base = reinterpret_cast<uintptr_t>(Mapping.AllocationBase);
+    const auto Line = fextl::fmt::format(
+      "FEX-HANG sample={} tid={:x} status={:x} prior_suspend={} host_pc={:x} eip={:x} esp={:x} ebp={:x} base={:x} rva={:x} type={:x}\n",
+      Sample, HangCaptureTID, uint32_t(Status), PreviousCount, Native.Pc, Guest.Eip, Guest.Esp, Guest.Ebp, Base,
+      Base ? uintptr_t(Guest.Eip) - Base : 0, Mapping.Type);
+    HangCaptureOutput(Line.c_str());
+    Delay.QuadPart = -3LL * 10000000;
+    NtDelayExecution(FALSE, &Delay);
+  }
+  HangCaptureOutput("FEX-HANG: capture complete\n");
+  return nullptr;
+}
 
 std::pair<NTSTATUS, TLS> GetThreadTLS(HANDLE Thread) {
   THREAD_BASIC_INFORMATION Info;
@@ -442,6 +496,18 @@ public:
       ReturnRAX = static_cast<uint64_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, ULongToPtr(StackArgs->Args)));
       Context::LockJITContext();
       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
+    } else if (BridgeInstrs::HangCapture && Frame->State.rip == (uint64_t)BridgeInstrs::HangCapture) {
+      // This is an x86 stdcall thread entry point, not a native function
+      // pointer. Older Wine versions ignore SKIP_LOADER_INIT and otherwise
+      // truncate native worker entry points into an unmapped guest EIP.
+      // Consume the return address and the single thread-procedure argument.
+      Frame->State.gregs[FEXCore::X86State::REG_RSP] = ReturnRSP + 4;
+      Frame->State.rip = ReturnRIP;
+      Context::FlushThreadStateContext();
+      Context::UnlockJITContext();
+      CaptureStartupHang(nullptr);
+      Context::LockJITContext();
+      Frame->State.gregs[FEXCore::X86State::REG_RAX] = 0;
     } else if (Frame->State.rip == (uint64_t)BridgeInstrs::Syscall) {
       const uint64_t EntryRAX = Frame->State.gregs[FEXCore::X86State::REG_RAX];
 
@@ -515,6 +581,12 @@ void BTCpuProcessInit() {
   SyscallHandler = fextl::make_unique<WowSyscallHandler>();
   const auto NtDll = GetModuleHandleW(L"ntdll.dll");
   const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
+  if (IsWine && ExecutableName == "MonsterLovesYou.exe") {
+    HangCaptureOutput = reinterpret_cast<decltype(HangCaptureOutput)>(GetProcAddress(NtDll, "__wine_dbg_output"));
+    if (HangCaptureOutput) {
+      HangCaptureTID = GetCurrentThreadId();
+    }
+  }
   OvercommitTracker.emplace(IsWine);
 
   FEX::Windows::Allocator::SetupHooks(NtDll);
@@ -545,13 +617,22 @@ void BTCpuProcessInit() {
   CPUFeatures.emplace(*CTX);
 
   // Allocate the syscall/unixcall trampolines in the lower 2GB of the address space
-  SIZE_T Size = 4;
+  SIZE_T Size = HangCaptureTID ? 6 : 4;
   void* Addr = nullptr;
   NtAllocateVirtualMemory(NtCurrentProcess(), &Addr, (1U << 31) - 1, &Size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
   InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Addr), Size, PAGE_EXECUTE);
   *reinterpret_cast<uint32_t*>(Addr) = 0x2ecd2ecd;
   BridgeInstrs::Syscall = Addr;
   BridgeInstrs::UnixCall = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(Addr) + 2);
+  if (HangCaptureTID) {
+    // Enter through the same int 0x2e bridge as the existing WOW64 thunks.
+    // The guest loader runs normally, then the handler executes the sampler
+    // natively with the JIT lock released and returns to the guest thread exit.
+    auto* Stub = reinterpret_cast<uint8_t*>(Addr) + 4;
+    Stub[0] = 0xcd;
+    Stub[1] = 0x2e;
+    BridgeInstrs::HangCapture = Stub;
+  }
 
   const auto Sym = GetProcAddress(NtDll, "__wine_unix_call_dispatcher");
   if (Sym) {
@@ -711,6 +792,28 @@ __attribute__((naked)) void BTCpuSimulate() {
 }
 
 extern "C" void BTCpuSimulateImpl(CONTEXT* entry_context) {
+  // Start once, on the process's initial thread, after its WOW64 state exists.
+  if (HangCaptureTID && GetCurrentThreadId() == HangCaptureTID && !HangCaptureWorker) {
+    auto Target = FEX::Windows::DupHandle(NtCurrentThread(), THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT);
+    if (Target) {
+      HangCaptureTarget.reset(*Target);
+      *Target = INVALID_HANDLE_VALUE;
+      HANDLE Worker = nullptr;
+      const auto Status = NtCreateThreadEx(&Worker, THREAD_ALL_ACCESS, nullptr, NtCurrentProcess(),
+                                           reinterpret_cast<PRTL_THREAD_START_ROUTINE>(BridgeInstrs::HangCapture),
+                                           nullptr, 0, 0, 0, 0, nullptr);
+      if (!Status) {
+        HangCaptureWorker.reset(Worker);
+        HangCaptureOutput("FEX-HANG: main-thread capture armed (15s delay, 12 samples)\n");
+      } else {
+        HangCaptureOutput("FEX-HANG: could not start sampler\n");
+        HangCaptureTID = 0;
+      }
+    } else {
+      HangCaptureOutput("FEX-HANG: could not open main thread\n");
+      HangCaptureTID = 0;
+    }
+  }
   const auto TLS = GetTLS();
   TLS.EntryContext() = entry_context;
   TLS.CachedCallRetSp() = TLS.ThreadState()->CurrentFrame->State.callret_sp;
