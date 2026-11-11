@@ -19,7 +19,6 @@ $end_info$
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/LogManager.h>
-#include <FEXCore/Utils/Threads.h>
 #include <FEXCore/Utils/Profiler.h>
 #include <FEXCore/Utils/SHMStats.h>
 #include <FEXCore/Utils/EnumOperators.h>
@@ -131,6 +130,7 @@ namespace BridgeInstrs {
   // These directly jumped to by the guest to make system calls
   void* Syscall {};
   void* UnixCall {};
+  void* HangCapture {};
 } // namespace BridgeInstrs
 
 fextl::unique_ptr<FEXCore::Context::Context> CTX;
@@ -154,9 +154,10 @@ decltype(__wine_unix_call_dispatcher) WineUnixCall;
 DWORD HangCaptureTID {};
 void (*HangCaptureOutput)(const char*);
 FEX::Windows::ScopedHandle HangCaptureTarget;
-fextl::unique_ptr<FEXCore::Threads::Thread> HangCaptureWorker;
+FEX::Windows::ScopedHandle HangCaptureWorker;
 
 void* CaptureStartupHang(void*) {
+  HangCaptureOutput("FEX-HANG: sampler entered through x86 bridge\n");
   LARGE_INTEGER Delay;
   Delay.QuadPart = -15LL * 10000000;
   NtDelayExecution(FALSE, &Delay);
@@ -495,6 +496,18 @@ public:
       ReturnRAX = static_cast<uint64_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, ULongToPtr(StackArgs->Args)));
       Context::LockJITContext();
       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
+    } else if (BridgeInstrs::HangCapture && Frame->State.rip == (uint64_t)BridgeInstrs::HangCapture) {
+      // This is an x86 stdcall thread entry point, not a native function
+      // pointer. Older Wine versions ignore SKIP_LOADER_INIT and otherwise
+      // truncate native worker entry points into an unmapped guest EIP.
+      // Consume the return address and the single thread-procedure argument.
+      Frame->State.gregs[FEXCore::X86State::REG_RSP] = ReturnRSP + 4;
+      Frame->State.rip = ReturnRIP;
+      Context::FlushThreadStateContext();
+      Context::UnlockJITContext();
+      CaptureStartupHang(nullptr);
+      Context::LockJITContext();
+      Frame->State.gregs[FEXCore::X86State::REG_RAX] = 0;
     } else if (Frame->State.rip == (uint64_t)BridgeInstrs::Syscall) {
       const uint64_t EntryRAX = Frame->State.gregs[FEXCore::X86State::REG_RAX];
 
@@ -604,13 +617,22 @@ void BTCpuProcessInit() {
   CPUFeatures.emplace(*CTX);
 
   // Allocate the syscall/unixcall trampolines in the lower 2GB of the address space
-  SIZE_T Size = 4;
+  SIZE_T Size = HangCaptureTID ? 6 : 4;
   void* Addr = nullptr;
   NtAllocateVirtualMemory(NtCurrentProcess(), &Addr, (1U << 31) - 1, &Size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
   InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Addr), Size, PAGE_EXECUTE);
   *reinterpret_cast<uint32_t*>(Addr) = 0x2ecd2ecd;
   BridgeInstrs::Syscall = Addr;
   BridgeInstrs::UnixCall = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(Addr) + 2);
+  if (HangCaptureTID) {
+    // Enter through the same int 0x2e bridge as the existing WOW64 thunks.
+    // The guest loader runs normally, then the handler executes the sampler
+    // natively with the JIT lock released and returns to the guest thread exit.
+    auto* Stub = reinterpret_cast<uint8_t*>(Addr) + 4;
+    Stub[0] = 0xcd;
+    Stub[1] = 0x2e;
+    BridgeInstrs::HangCapture = Stub;
+  }
 
   const auto Sym = GetProcAddress(NtDll, "__wine_unix_call_dispatcher");
   if (Sym) {
@@ -776,8 +798,12 @@ extern "C" void BTCpuSimulateImpl(CONTEXT* entry_context) {
     if (Target) {
       HangCaptureTarget.reset(*Target);
       *Target = INVALID_HANDLE_VALUE;
-      HangCaptureWorker = FEXCore::Threads::Thread::Create(CaptureStartupHang, nullptr, {.Internal = true}, "FEX-hang-capture");
-      if (HangCaptureWorker && HangCaptureWorker->joinable()) {
+      HANDLE Worker = nullptr;
+      const auto Status = NtCreateThreadEx(&Worker, THREAD_ALL_ACCESS, nullptr, NtCurrentProcess(),
+                                           reinterpret_cast<PRTL_THREAD_START_ROUTINE>(BridgeInstrs::HangCapture),
+                                           nullptr, 0, 0, 0, 0, nullptr);
+      if (!Status) {
+        HangCaptureWorker.reset(Worker);
         HangCaptureOutput("FEX-HANG: main-thread capture armed (15s delay, 12 samples)\n");
       } else {
         HangCaptureOutput("FEX-HANG: could not start sampler\n");
