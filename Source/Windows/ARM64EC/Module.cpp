@@ -155,6 +155,130 @@ std::recursive_mutex ThreadCreationMutex;
 // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
 std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
 
+// Bounded, executable-scoped diagnostic for a post-splash wait. Never log,
+// allocate, resolve modules, or hold ThreadCreationMutex while a target is paused.
+bool WaitCaptureStarted {};
+DWORD WaitCaptureMainTID {};
+void (*WaitCaptureOutput)(const char*);
+using OpenThreadFn = NTSTATUS(WINAPI*)(HANDLE*, ACCESS_MASK, OBJECT_ATTRIBUTES*, CLIENT_ID*);
+using ReadMemoryFn = NTSTATUS(WINAPI*)(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
+using ResumeThreadFn = NTSTATUS(WINAPI*)(HANDLE, ULONG*);
+OpenThreadFn WaitCaptureOpenThread;
+ReadMemoryFn WaitCaptureReadMemory;
+ResumeThreadFn WaitCaptureResumeThread;
+
+static void WaitCaptureAddress(DWORD TID, unsigned Round, const char* Kind, unsigned Slot, uint64_t Address) {
+  MEMORY_BASIC_INFORMATION Info {};
+  if (!Address || NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation,
+                                       &Info, sizeof(Info), nullptr) ||
+      Info.State != MEM_COMMIT || (Info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+      !(Info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+    return;
+  }
+  const auto Path = FEX::Windows::GetSectionFilePath(Address);
+  const auto Name = FEX::Windows::BaseName(Path);
+  char Line[512];
+  snprintf(Line, sizeof(Line), "[FEX wait-capture] round=%u tid=%lx %s[%u]=%llx module=%.*s+%llx\n", Round,
+           static_cast<unsigned long>(TID), Kind, Slot, static_cast<unsigned long long>(Address),
+           static_cast<int>(std::min<size_t>(Name.size(), 160)), Name.data(),
+           static_cast<unsigned long long>(Address - reinterpret_cast<uintptr_t>(Info.AllocationBase)));
+  WaitCaptureOutput(Line);
+}
+
+static DWORD WINAPI CaptureUnityWaits(void*) {
+  WaitCaptureOutput("[FEX wait-capture] sampler-entry; ARM64EC; four delayed snapshots; stack words are candidates, not unwound frames\n");
+  for (unsigned Round = 0; Round != 4; ++Round) {
+    LARGE_INTEGER Delay;
+    Delay.QuadPart = -(Round == 0 ? 15LL : 10LL) * 10000000LL;
+    NtDelayExecution(FALSE, &Delay);
+    DWORD TIDs[256] {};
+    size_t Count = 0;
+    {
+      std::scoped_lock Lock(ThreadCreationMutex);
+      // Preserve the main thread even if a game has more threads than the cap.
+      TIDs[Count++] = WaitCaptureMainTID;
+      for (const auto& [TID, State] : Threads) {
+        if (TID != WaitCaptureMainTID && TID != GetCurrentThreadId() && Count < std::size(TIDs)) {
+          TIDs[Count++] = TID;
+        }
+      }
+    }
+    unsigned Captured = 0;
+    for (size_t I = 0; I < Count && Captured < 3; ++I) {
+      OBJECT_ATTRIBUTES Attributes {};
+      Attributes.Length = sizeof(Attributes);
+      CLIENT_ID Client {reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId())),
+                        reinterpret_cast<HANDLE>(static_cast<uintptr_t>(TIDs[I]))};
+      HANDLE Target {};
+      if (WaitCaptureOpenThread(&Target, THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+                                &Attributes, &Client)) {
+        continue;
+      }
+      struct {
+        UNICODE_STRING Name;
+        WCHAR Buffer[128];
+      } NameInfo {};
+      WCHAR Name[128] {};
+      if (!NtQueryInformationThread(Target, static_cast<THREADINFOCLASS>(38), &NameInfo, sizeof(NameInfo), nullptr) &&
+          NameInfo.Name.Buffer && NameInfo.Name.Length < sizeof(Name)) {
+        const auto Begin = reinterpret_cast<uintptr_t>(NameInfo.Name.Buffer);
+        const auto Low = reinterpret_cast<uintptr_t>(&NameInfo);
+        if (Begin >= Low && Begin + NameInfo.Name.Length <= Low + sizeof(NameInfo)) {
+          memcpy(Name, NameInfo.Name.Buffer, NameInfo.Name.Length);
+        }
+      }
+      if (TIDs[I] != WaitCaptureMainTID && wcscmp(Name, L"Loading.Preload") && wcscmp(Name, L"UnityGfxDeviceWorker")) {
+        NtClose(Target);
+        continue;
+      }
+      ++Captured;
+      const char* Role = TIDs[I] == WaitCaptureMainTID ? "main" :
+                         !wcscmp(Name, L"Loading.Preload") ? "Loading.Preload" : "UnityGfxDeviceWorker";
+      CONTEXT Context {};
+      Context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+      uint64_t Stack[256] {};
+      SIZE_T Bytes = 0;
+      NTSTATUS ContextStatus = STATUS_UNSUCCESSFUL;
+      NTSTATUS ReadStatus = STATUS_UNSUCCESSFUL;
+      NTSTATUS ResumeStatus = STATUS_SUCCESS;
+      const auto SuspendStatus = NtSuspendThread(Target, nullptr);
+      if (!SuspendStatus) {
+        ContextStatus = NtGetContextThread(Target, &Context);
+        if (!ContextStatus) {
+          ReadStatus = WaitCaptureReadMemory(NtCurrentProcess(), reinterpret_cast<void*>(Context.Rsp), Stack, sizeof(Stack), &Bytes);
+        }
+        // Always balance our suspend, including failed context/stack reads.
+        ResumeStatus = WaitCaptureResumeThread(Target, nullptr);
+      }
+      NtClose(Target);
+      char Line[512];
+      snprintf(Line, sizeof(Line), "[FEX wait-capture] round=%u tid=%lx role=%s suspend=%lx context=%lx read=%lx resume=%lx rip=%llx rsp=%llx bytes=%llu\n",
+               Round, static_cast<unsigned long>(TIDs[I]), Role,
+               static_cast<unsigned long>(SuspendStatus), static_cast<unsigned long>(ContextStatus),
+               static_cast<unsigned long>(ReadStatus), static_cast<unsigned long>(ResumeStatus),
+               static_cast<unsigned long long>(Context.Rip), static_cast<unsigned long long>(Context.Rsp),
+               static_cast<unsigned long long>(Bytes));
+      WaitCaptureOutput(Line);
+      // No module queries after a failed resume; report it and stop the sampler.
+      if (ResumeStatus) {
+        return 0;
+      }
+      if (!SuspendStatus && !ContextStatus) {
+        WaitCaptureAddress(TIDs[I], Round, "pc", 0, Context.Rip);
+        for (size_t Slot = 0; Slot < std::min<size_t>(Bytes / sizeof(uint64_t), std::size(Stack)); ++Slot) {
+          WaitCaptureAddress(TIDs[I], Round, "stack-candidate", Slot, Stack[Slot]);
+        }
+      }
+    }
+    char Line[128];
+    snprintf(Line, sizeof(Line), "[FEX wait-capture] round=%u selected=%u registered=%llu\n", Round, Captured,
+             static_cast<unsigned long long>(Count));
+    WaitCaptureOutput(Line);
+  }
+  WaitCaptureOutput("[FEX wait-capture] complete\n");
+  return 0;
+}
+
 std::pair<NTSTATUS, ThreadCPUArea> GetThreadCPUArea(HANDLE Thread) {
   THREAD_BASIC_INFORMATION Info;
   const NTSTATUS Err = NtQueryInformationThread(Thread, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
@@ -1006,7 +1130,7 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
 }
 
 NTSTATUS ThreadInit() {
-  std::scoped_lock Lock(ThreadCreationMutex);
+  std::unique_lock Lock(ThreadCreationMutex);
   FEX::Windows::InitCRTThread();
   const auto CPUArea = GetCPUArea();
 
@@ -1071,6 +1195,35 @@ NTSTATUS ThreadInit() {
 
   CPUArea.ThreadState() = Thread;
   CPUArea.Area->SuspendDoorbell = reinterpret_cast<ULONG*>(&Thread->CurrentFrame->SuspendDoorbell);
+  const bool StartCapture = !WaitCaptureStarted && AppConfigName == "Peeping Dorm Manager.exe";
+  if (StartCapture) {
+    WaitCaptureStarted = true;
+    WaitCaptureMainTID = GetCurrentThreadId();
+  }
+  Lock.unlock();
+  if (StartCapture) {
+    const auto NtDll = GetModuleHandleW(L"ntdll.dll");
+    WaitCaptureOutput = reinterpret_cast<decltype(WaitCaptureOutput)>(GetProcAddress(NtDll, "__wine_dbg_output"));
+    WaitCaptureOpenThread = reinterpret_cast<OpenThreadFn>(GetProcAddress(NtDll, "NtOpenThread"));
+    WaitCaptureReadMemory = reinterpret_cast<ReadMemoryFn>(GetProcAddress(NtDll, "NtReadVirtualMemory"));
+    WaitCaptureResumeThread = reinterpret_cast<ResumeThreadFn>(GetProcAddress(NtDll, "NtResumeThread"));
+    if (WaitCaptureOutput && WaitCaptureOpenThread && WaitCaptureReadMemory && WaitCaptureResumeThread) {
+      HANDLE Worker {};
+      // An ordinary ARM64EC thread: Wine performs its normal loader/CRT/FEX
+      // thread initialization and exit. Do not depend on skip-init flags.
+      const auto Status = NtCreateThreadEx(&Worker, THREAD_ALL_ACCESS, nullptr, NtCurrentProcess(),
+                                           reinterpret_cast<PRTL_THREAD_START_ROUTINE>(&CaptureUnityWaits), nullptr, 0, 0, 0, 0, nullptr);
+      char Line[128];
+      snprintf(Line, sizeof(Line), "[FEX wait-capture] create=%lx main=%lx\n", static_cast<unsigned long>(Status),
+               static_cast<unsigned long>(WaitCaptureMainTID));
+      WaitCaptureOutput(Line);
+      if (!Status) {
+        NtClose(Worker);
+      }
+    } else if (WaitCaptureOutput) {
+      WaitCaptureOutput("[FEX wait-capture] unavailable: missing NT thread or memory API\n");
+    }
+  }
   return STATUS_SUCCESS;
 }
 
