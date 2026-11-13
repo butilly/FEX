@@ -638,6 +638,8 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
   Exception::LoadStateFromECContext(Thread, *Context);
 }
 
+#include "HangDiagnostic.h"
+
 NTSTATUS ProcessInit() {
   if (!InitSyscalls()) {
     return STATUS_NOT_SUPPORTED;
@@ -713,6 +715,7 @@ NTSTATUS ProcessInit() {
     std::this_thread::sleep_for(std::chrono::seconds(StartupSleep()));
   }
 
+  DotAgeDiagnostic::Start();
   return STATUS_SUCCESS;
 }
 
