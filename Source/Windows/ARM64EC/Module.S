@@ -158,7 +158,9 @@ DIRECT_SYSCALL_WRAPPER("#NtProtectVirtualMemoryNative", WineNtProtectVirtualMemo
   subs x16, x11, x9
   b.lo end
   adrp x17, NtDllRedirectionLUTSize
-  ldr x17, [x17, #:lo12:NtDllRedirectionLUTSize]
+  // The C++ size is uint32_t: do not require 8-byte alignment or read the
+  // adjacent global as the upper half of the bounds check.
+  ldr w17, [x17, #:lo12:NtDllRedirectionLUTSize]
   cmp x16, x17
   b.hi end
   adrp x17, NtDllRedirectionLUT
