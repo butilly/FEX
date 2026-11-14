@@ -115,10 +115,12 @@ WOW64_CONTEXT* GetWow64Context() {
 }
 
 struct FrontendThreadData {
+  FEX::Windows::ScopedHandle ThreadHandle;
   bool InLockedRWXRead {};
   CHPE_V2_CPU_AREA_INFO CpuArea {};
 
-  FrontendThreadData(const TLS& TLS) {
+  FrontendThreadData(const TLS& TLS, FEX::Windows::ScopedHandle&& ThreadHandle)
+    : ThreadHandle {std::move(ThreadHandle)} {
     CpuArea.SuspendDoorbell = reinterpret_cast<ULONG*>(&TLS.ThreadState()->CurrentFrame->SuspendDoorbell);
     TLS.CpuArea() = &CpuArea;
   }
@@ -246,6 +248,62 @@ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread) {
   State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (XSave->StatusWord >> 14) & 1;
   State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (XSave->StatusWord >> 11) & 0b111;
   State.AbridgedFTW = XSave->TagWord;
+
+  // If any of the debug register state changed then we need to invalidate.
+  const bool Dr0Changed = (Context->Dr0 != State.Dr[0]) || ((Context->Dr7 ^ State.Dr7) & ((0b1111 << 16) | (0b11 << 0)));
+  const bool Dr1Changed = (Context->Dr1 != State.Dr[1]) || ((Context->Dr7 ^ State.Dr7) & ((0b1111 << 20) | (0b11 << 2)));
+  const bool Dr2Changed = (Context->Dr2 != State.Dr[2]) || ((Context->Dr7 ^ State.Dr7) & ((0b1111 << 24) | (0b11 << 4)));
+  const bool Dr3Changed = (Context->Dr3 != State.Dr[3]) || ((Context->Dr7 ^ State.Dr7) & ((0b1111 << 28) | (0b11 << 6)));
+
+  if (Dr0Changed || Dr1Changed || Dr2Changed || Dr3Changed) {
+    std::scoped_lock Lock(ThreadCreationMutex);
+    // Need to clear both context and state addresses if changed.
+    // Only if the BP type was instruction class.
+    if (Dr0Changed) {
+      if (Context->Dr0 && ((Context->Dr7 >> 16) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(Context->Dr0, 8, false);
+      }
+
+      if (State.Dr[0] && ((State.Dr7 >> 16) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(State.Dr[0], 8, false);
+      }
+    }
+    if (Dr1Changed) {
+      if (Context->Dr1 && ((Context->Dr7 >> 20) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(Context->Dr1, 8, false);
+      }
+
+      if (State.Dr[1] && ((State.Dr7 >> 20) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(State.Dr[1], 8, false);
+      }
+    }
+    if (Dr2Changed) {
+      if (Context->Dr2 && ((Context->Dr7 >> 24) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(Context->Dr2, 8, false);
+      }
+
+      if (State.Dr[2] && ((State.Dr7 >> 24) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(State.Dr[2], 8, false);
+      }
+    }
+    if (Dr3Changed) {
+      if (Context->Dr3 && ((Context->Dr7 >> 28) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(Context->Dr3, 8, false);
+      }
+
+      if (State.Dr[3] && ((State.Dr7 >> 28) & 0b11) == 0) {
+        InvalidationTracker->InvalidateAlignedInterval(State.Dr[3], 8, false);
+      }
+    }
+  }
+
+  // Update context now that we have invalidated.
+  State.Dr[0] = Context->Dr0;
+  State.Dr[1] = Context->Dr1;
+  State.Dr[2] = Context->Dr2;
+  State.Dr[3] = Context->Dr3;
+  State.Dr6 = Context->Dr6;
+  State.Dr7 = Context->Dr7;
 }
 
 void StoreWowContextFromState(WOW64_CONTEXT* Context) {
@@ -294,6 +352,14 @@ void StoreWowContextFromState(WOW64_CONTEXT* Context) {
   Context->FloatSave.DataOffset = XSave->DataOffset;
   Context->FloatSave.DataSelector = XSave->DataSelector;
   Context->FloatSave.Cr0NpxState = XSave->StatusWord | 0xffff0000;
+
+  // Save the debug register state to the context.
+  Context->Dr0 = State.Dr[0];
+  Context->Dr1 = State.Dr[1];
+  Context->Dr2 = State.Dr[2];
+  Context->Dr3 = State.Dr[3];
+  Context->Dr6 = State.Dr6;
+  Context->Dr7 = State.Dr7;
 }
 
 void FlushThreadStateContext() {
@@ -577,7 +643,59 @@ void BTCpuProcessInit() {
   }
 }
 
-void BTCpuProcessTerm(HANDLE Handle, BOOL After, ULONG Status) {}
+static void SuspendAllThreads() {
+  // Pulse suspending with lock to ensure threads exit.
+
+  const auto CurrentThread = GetCurrentThreadId();
+  while (true) {
+    bool AllSuspended = true;
+    {
+      // Hold the thread creation mutex so none are created while we're suspending.
+      std::scoped_lock Lock(ThreadCreationMutex);
+      for (auto& Thread : Threads) {
+        bool Self = Thread.first == CurrentThread;
+        if (Self) {
+          // Don't suspend self.
+          continue;
+        }
+
+        auto FrontendData = GetFrontendThreadData(Thread.second);
+        ULONG SuspendCount {};
+        RtlWow64SuspendThread(*FrontendData->ThreadHandle, &SuspendCount);
+
+        if (SuspendCount != 0) {
+          // This will wait for the thread to be suspended. Only execute if we know the thread /should/ be suspended.
+          // SuspendCount may saturate to max, but we don't care here.
+          CONTEXT TmpContext;
+          TmpContext.ContextFlags = CONTEXT_CONTROL;
+          NtGetContextThread(*FrontendData->ThreadHandle, &TmpContext);
+        } else {
+          // Wasn't suspended.
+          AllSuspended = false;
+        }
+      }
+    }
+
+    if (AllSuspended) {
+      // All threads suspended, free to continue.
+      break;
+    }
+
+    // Wait a second to let threads catch up.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+
+void BTCpuProcessTerm(HANDLE Handle, BOOL After, ULONG Status) {
+  if (After == false) {
+    // Someone called `NtTerminateProcess`. It is FEX's responsibility to spin down the threads in this moment.
+    // After we return from this, WINE will start indiscriminately killing threads with SIGQUIT.
+    // If we don't stop them now, then locks will be held by dead threads while the final process thread is trying to finish.
+    // This isn't 100% correct since another process calling `NtTerminateProcess` on our current process will SIGQUIT without warning.
+    // We need WINE patches to capture this properly.
+    SuspendAllThreads();
+  }
+}
 
 void BTCpuThreadInit() {
   static constexpr size_t DefaultWow64CS {4};
@@ -608,9 +726,9 @@ void BTCpuThreadInit() {
   const auto TLS = GetTLS();
   TLS.ThreadState() = Thread;
 
-  Thread->FrontendPtr = new FrontendThreadData(TLS);
-
   auto ThreadTID = GetCurrentThreadId();
+  Thread->FrontendPtr = new FrontendThreadData(
+    TLS, FEX::Windows::DupHandle(GetCurrentThread(), THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT));
   Threads.emplace(ThreadTID, Thread);
   if (StatAllocHandler) {
     Thread->ThreadStats = StatAllocHandler->AllocateSlot(ThreadTID);
@@ -767,6 +885,11 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
         return true;
       }
     }
+  }
+
+  if (Context->Pc == reinterpret_cast<uint64_t>(&FEXCore::Assert::ForcedAssert)) {
+    LogMan::Msg::DFmt("FEX: Forced assert");
+    NtTerminateProcess(NtCurrentProcess(), 0x42);
   }
 
   if (!Thread || !IsAddressInJit(Context->Pc)) {

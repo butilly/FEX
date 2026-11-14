@@ -272,6 +272,7 @@ enum InstType {
   TYPE_INST,
   TYPE_X87 = TYPE_INST,
   TYPE_INVALID,
+  TYPE_UNIMPLEMENTED,
   TYPE_COPY_OTHER,
   // Changes `X86InstInfo::OpcodeDispatcher` member to use the `Indirect` version.
   // Points to a 2 member array of X86InstInfo to choose instruction description based on executing bitness.
@@ -407,7 +408,9 @@ namespace InstFlags {
   constexpr InstFlagType FLAGS_CALL = (1ULL << 30);
   constexpr InstFlagType FLAGS_SUPPORTS_LOCK = (1ULL << 31);
   constexpr InstFlagType FLAGS_LITERAL_PATCHABLE = (1ULL << 32);
-  // Flags [57..33]: Undefined
+  constexpr InstFlagType FLAGS_NO_PREFIX_ORDER = (1ULL << 33);
+
+  // Flags [57..34]: Undefined
   // Flags [60..58]: Dst size
   constexpr InstFlagType FLAGS_SIZE_DST_OFF = 58;
   // Flags [63..61]: Src size
@@ -519,7 +522,7 @@ constexpr size_t MAX_INST_GROUP_TABLE_SIZE = 512;
 // 12 (groups) | 3(max indexes) | 8 ops = 0b1111'11'111 = 9 bits
 constexpr size_t MAX_INST_SECOND_GROUP_TABLE_SIZE = 512;
 constexpr size_t MAX_X87_TABLE_SIZE = 1 << 11;
-constexpr size_t MAX_SECOND_MODRM_TABLE_SIZE = 32;
+constexpr size_t MAX_SECOND_MODRM_TABLE_SIZE = 40;
 // (3 bit prefixes) | 8 bit opcode
 constexpr size_t MAX_0F_38_TABLE_SIZE = (1 << 11);
 // 1 REX | 1 prefixes | 8 bit opcode
