@@ -50,6 +50,7 @@ $end_info$
 #include "BTInterface.h"
 #include "Windows/Common/SHMStats.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <type_traits>
@@ -638,18 +639,137 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
   Exception::LoadStateFromECContext(Thread, *Context);
 }
 
+namespace {
+// Diagnostic round 1: configuration can fail before Logging::Init installs the
+// normal handlers. Keep this path allocation-free, executable-scoped and bounded.
+int (*StartupDbgOutput)(const char*);
+constinit std::atomic<unsigned> StartupMessages {0};
+constinit std::atomic<const char*> StartupStage {"entry"};
+
+bool IsStartupDiagnosticTarget() {
+  const auto* Params = reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters);
+  if (!Params) {
+    return false;
+  }
+  const auto* Path = reinterpret_cast<const WCHAR*>(Params->ImagePathName.Buffer);
+  const size_t Length = Params->ImagePathName.Length / sizeof(WCHAR);
+  if (!Path) {
+    return false;
+  }
+  size_t Base = 0;
+  for (size_t i = 0; i < Length; ++i) {
+    if (Path[i] == '\\' || Path[i] == '/') {
+      Base = i + 1;
+    }
+  }
+  for (const char* Name : {"rustler.exe", "unitycrashhandler64.exe"}) {
+    size_t i = 0;
+    for (; Base + i < Length && Name[i]; ++i) {
+      WCHAR C = Path[Base + i];
+      if (C >= 'A' && C <= 'Z') {
+        C += 'a' - 'A';
+      }
+      if (C != Name[i]) {
+        break;
+      }
+    }
+    if (Base + i == Length && !Name[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void StartupDiagnostic(const char* Kind, const char* Message, uint64_t Code = 0, uint64_t PC = 0) {
+  if (!StartupDbgOutput || StartupMessages.load(std::memory_order_relaxed) >= 48 ||
+      StartupMessages.fetch_add(1, std::memory_order_relaxed) >= 48) {
+    return;
+  }
+  // Consume the budget before calling into Wine (reentrancy).
+  char Buffer[768];
+  size_t Pos = 0;
+  const auto Append = [&](const char* Text) {
+    while (*Text && Pos < sizeof(Buffer) - 2) {
+      Buffer[Pos++] = *Text++;
+    }
+  };
+  const auto Hex = [&](uint64_t Value) {
+    for (int Shift = 60; Shift >= 0 && Pos < sizeof(Buffer) - 2; Shift -= 4) {
+      Buffer[Pos++] = "0123456789abcdef"[(Value >> Shift) & 15];
+    }
+  };
+  Append("FEX-STARTUP pid=");
+  Hex(reinterpret_cast<uintptr_t>(reinterpret_cast<__TEB*>(NtCurrentTeb())->ClientId.UniqueProcess));
+  Append(" tid=");
+  Hex(reinterpret_cast<uintptr_t>(reinterpret_cast<__TEB*>(NtCurrentTeb())->ClientId.UniqueThread));
+  Append(" stage=");
+  Append(StartupStage.load(std::memory_order_relaxed));
+  Append(" kind=");
+  Append(Kind);
+  Append(" code=");
+  Hex(Code);
+  Append(" pc=");
+  Hex(PC);
+  Append(" fex-base=");
+  Hex(reinterpret_cast<uintptr_t>(&__ImageBase));
+  Append(" ");
+  Append(Message);
+  Buffer[Pos++] = '\n';
+  Buffer[Pos] = 0;
+  StartupDbgOutput(Buffer);
+}
+
+void StartupMark(const char* Stage) {
+  StartupStage.store(Stage, std::memory_order_relaxed);
+  StartupDiagnostic("stage", "");
+}
+
+void StartupAssert(const char* Message) {
+  StartupDiagnostic("assert", Message);
+}
+
+void StartupLog(LogMan::DebugLevels Level, const char* Message) {
+  if (Level == LogMan::ERROR || Level == LogMan::ASSERT) {
+    StartupDiagnostic("log", Message);
+  }
+}
+} // namespace
+
 NTSTATUS ProcessInit() {
+  if (IsStartupDiagnosticTarget()) {
+    StartupDbgOutput = reinterpret_cast<decltype(StartupDbgOutput)>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_dbg_output"));
+  }
+  StartupMark("syscalls-begin");
   if (!InitSyscalls()) {
+    StartupMark("syscalls-unsupported");
     return STATUS_NOT_SUPPORTED;
   }
 
+  StartupMark("crt-begin");
   FEX::Windows::InitCRTProcess();
+  StartupMark("crt-ready");
+  if (StartupDbgOutput) {
+    LogMan::Throw::InstallHandler(StartupAssert);
+    LogMan::Msg::InstallHandler(StartupLog);
+  }
   FEX::Windows::SetupThreadHandlers();
+  StartupMark("thread-handlers-ready");
   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
   AppConfigName = FEX::Windows::BaseName(ExecutablePath);
-  FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
+  StartupDiagnostic("exe", AppConfigName.c_str());
+  StartupMark("portability-begin");
+  const auto PortabilityInfo = FEX::ReadPortabilityInformation();
+  StartupMark("config-begin");
+  FEX::Config::LoadConfig(AppConfigName, _environ, PortabilityInfo);
+  StartupMark("config-loaded");
   FEXCore::Config::ReloadMetaLayer();
+  StartupMark("meta-ready");
+  if (StartupDbgOutput) {
+    LogMan::Throw::UnInstallHandler();
+    LogMan::Msg::UnInstallHandler();
+  }
   FEX::Windows::Logging::Init();
+  StartupMark("logging-ready");
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, AppConfigName);
 
@@ -667,25 +787,30 @@ NTSTATUS ProcessInit() {
   FEX::Windows::SetupEnvironmentVariableValues(NtDll);
 
   FEX::Windows::Allocator::SetupHooks(NtDll);
+  StartupMark("unixlib-begin");
   FEX::Windows::UnixLib::Init(NtDll);
   if (FEX::Windows::UnixLib::Available()) {
     FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
   }
 
   {
+    StartupMark("host-features-begin");
     auto HostFeatures =
       FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Arm64ec, FEX::Windows::UnixLib::GetPID());
+    StartupMark("context-begin");
     CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
   }
 
   CTX->SetSignalDelegator(SignalDelegator.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
   CTX->InitCore();
+  StartupMark("core-ready");
   Exception::HandlerConfig.emplace(*CTX);
   InvalidationTracker.emplace(*CTX, Threads);
   ImageTracker.emplace(*CTX, false);
 
   auto MainModule = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress;
+  StartupMark("image-map-begin");
   HandleImageMap(reinterpret_cast<uint64_t>(MainModule), true);
 
   HandleImageMap(NtDllBase);
@@ -713,6 +838,7 @@ NTSTATUS ProcessInit() {
     std::this_thread::sleep_for(std::chrono::seconds(StartupSleep()));
   }
 
+  StartupMark("process-ready");
   return STATUS_SUCCESS;
 }
 
@@ -815,6 +941,9 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
 }
 
 NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
+  if (Exception->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
+    StartupDiagnostic("illegal-instruction", "native exception; guest instruction not inferred", Exception->ExceptionCode, NativeContext->Pc);
+  }
   bool Cont {};
   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
