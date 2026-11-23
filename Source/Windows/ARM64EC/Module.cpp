@@ -51,6 +51,7 @@ $end_info$
 #include "Windows/Common/SHMStats.h"
 
 #include <cstdint>
+#include <atomic>
 #include <cstdio>
 #include <type_traits>
 #include <mutex>
@@ -96,6 +97,9 @@ NTSTATUS NtAllocateVirtualMemoryNative(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULONG
 NTSTATUS NtProtectVirtualMemoryNative(HANDLE, PVOID*, SIZE_T*, ULONG, ULONG*);
 NTSTATUS NtRaiseExceptionNative(EXCEPTION_RECORD*, ARM64_NT_CONTEXT*, BOOL);
 static fextl::string AppConfigName {};
+alignas(16) static constexpr char DependencyStallExecutable[] = "Blood Sword.exe";
+alignas(16) static bool DependencyStallDiagnostic {};
+alignas(16) static std::atomic<uint64_t> DependencyStallSamples {};
 
 [[noreturn]]
 void JumpSetStack(uintptr_t PC, uintptr_t SP);
@@ -650,6 +654,10 @@ NTSTATUS ProcessInit() {
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
+  DependencyStallDiagnostic = AppConfigName == DependencyStallExecutable;
+  if (DependencyStallDiagnostic) {
+    LogMan::Msg::IFmt("GN dependency-stall diagnostic enabled: cooperative suspend RIP sampling, first 8 then every 1024, maximum 256 records");
+  }
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, AppConfigName);
 
@@ -796,9 +804,19 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
   // The JIT (in CompileBlock) emits code to check the suspend doorbell at the start of every block, and run the following instruction if it is set:
   static constexpr uint32_t SuspendTrapMagic {0xD4395FC0}; // brk #0xCAFE
   if (Exception->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && *reinterpret_cast<uint32_t*>(NativeContext->Pc) == SuspendTrapMagic) {
+    const auto HostPC = NativeContext->Pc;
     Exception::ReconstructThreadState(Thread, *NativeContext);
     *NativeContext = Exception::StoreStateToPackedECContext(Thread, NativeContext->Fpcr, NativeContext->Fpsr);
     LogMan::Msg::DFmt("Suspending: RIP: {:X} SP: {:X}", NativeContext->Pc, NativeContext->Sp);
+    // EventPipe reports only the last managed transition while executing native code.
+    // Preserve the real reconstructed guest PC without enabling unbounded debug logs.
+    if (DependencyStallDiagnostic) {
+      const auto Sample = DependencyStallSamples.fetch_add(1, std::memory_order_relaxed);
+      if (Sample < 8 || (Sample < 254976 && (Sample & 1023) == 0)) {
+        LogMan::Msg::IFmt("GN dependency-stall sample={} hostpc={:X} rip={:X} rsp={:X} rax={:X} rcx={:X} rdx={:X}",
+                         Sample, HostPC, NativeContext->Pc, NativeContext->Sp, NativeContext->X8, NativeContext->X0, NativeContext->X1);
+      }
+    }
     CPUArea.Area->InSimulation = 0;
     *CPUArea.Area->SuspendDoorbell = 0;
     return true;
