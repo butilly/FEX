@@ -97,8 +97,9 @@ NTSTATUS NtAllocateVirtualMemoryNative(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULONG
 NTSTATUS NtProtectVirtualMemoryNative(HANDLE, PVOID*, SIZE_T*, ULONG, ULONG*);
 NTSTATUS NtRaiseExceptionNative(EXCEPTION_RECORD*, ARM64_NT_CONTEXT*, BOOL);
 static fextl::string AppConfigName {};
-static bool DependencyStallDiagnostic {};
-static std::atomic<uint64_t> DependencyStallSamples {};
+alignas(16) static constexpr char DependencyStallExecutable[] = "Blood Sword.exe";
+alignas(16) static bool DependencyStallDiagnostic {};
+alignas(16) static std::atomic<uint64_t> DependencyStallSamples {};
 
 [[noreturn]]
 void JumpSetStack(uintptr_t PC, uintptr_t SP);
@@ -653,7 +654,7 @@ NTSTATUS ProcessInit() {
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
-  DependencyStallDiagnostic = AppConfigName == "Blood Sword.exe";
+  DependencyStallDiagnostic = AppConfigName == DependencyStallExecutable;
   if (DependencyStallDiagnostic) {
     LogMan::Msg::IFmt("GN dependency-stall diagnostic enabled: cooperative suspend RIP sampling, first 8 then every 1024, maximum 256 records");
   }
