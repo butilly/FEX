@@ -38,6 +38,10 @@ const std::array<std::string_view, FEXCore::Telemetry::TelemetryType::TYPE_LAST>
 };
 
 static bool Enabled {true};
+uint64_t ReadValue(TelemetryType Type) {
+  return TelemetryValues[Type].load(std::memory_order_relaxed);
+}
+
 void Initialize() {
   FEX_CONFIG_OPT(DisableTelemetry, DISABLETELEMETRY);
   if (DisableTelemetry) {

@@ -403,7 +403,7 @@ static bool HandleUnalignedAccess(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT&
     int Tear32 = -1;
     bool FirstTear {};
 #ifndef FEX_DISABLE_TELEMETRY
-    Tear32 = !!FEXCore::Telemetry::GetTelemetryValue(FEXCore::Telemetry::TYPE_CAS_32BIT_TEAR).load(std::memory_order_relaxed);
+    Tear32 = !!FEXCore::Telemetry::ReadValue(FEXCore::Telemetry::TYPE_CAS_32BIT_TEAR);
     static std::atomic<bool> ReportedTear {};
     if (Tear32) {
       FirstTear = !ReportedTear.exchange(true, std::memory_order_relaxed);
