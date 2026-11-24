@@ -44,6 +44,7 @@ inline Value& GetTelemetryValue(TelemetryType Type) {
 }
 
 FEX_DEFAULT_VISIBILITY void Initialize();
+FEX_DEFAULT_VISIBILITY uint64_t ReadValue(TelemetryType Type);
 FEX_DEFAULT_VISIBILITY void Shutdown(const fextl::string& ApplicationName);
 
 // Telemetry object declaration
