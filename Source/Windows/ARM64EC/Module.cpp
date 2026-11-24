@@ -17,6 +17,7 @@ $end_info$
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/Telemetry.h>
 #include <FEXCore/Utils/Threads.h>
 #include <FEXCore/Utils/Profiler.h>
 #include <FEXCore/Utils/SHMStats.h>
@@ -51,6 +52,7 @@ $end_info$
 #include "Windows/Common/SHMStats.h"
 
 #include <cstdint>
+#include <atomic>
 #include <cstdio>
 #include <type_traits>
 #include <mutex>
@@ -96,6 +98,7 @@ NTSTATUS NtAllocateVirtualMemoryNative(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULONG
 NTSTATUS NtProtectVirtualMemoryNative(HANDLE, PVOID*, SIZE_T*, ULONG, ULONG*);
 NTSTATUS NtRaiseExceptionNative(EXCEPTION_RECORD*, ARM64_NT_CONTEXT*, BOOL);
 static fextl::string AppConfigName {};
+static bool SplitLockDiagnostic {};
 
 [[noreturn]]
 void JumpSetStack(uintptr_t PC, uintptr_t SP);
@@ -374,8 +377,44 @@ struct alignas(16) KiUserExceptionDispatcherStackLayout {
 static bool HandleUnalignedAccess(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT& Context, bool IsJIT) {
   auto Thread = CPUArea.ThreadState();
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
+  const auto PC = Context.Pc;
+  uint32_t Instruction {};
+  uint64_t Address {}, Sample {};
+  bool TraceSample {};
+  if (SplitLockDiagnostic) {
+    Instruction = *reinterpret_cast<const uint32_t*>(PC);
+    const uint32_t AddressReg = (Instruction >> 5) & 31;
+    if ((Instruction >> 30) == 2 && AddressReg != 31) {
+      Address = (&Context.X0)[AddressReg];
+      if ((Address & 15) > 12) {
+        static std::atomic<uint64_t> Samples {};
+        Sample = Samples.fetch_add(1, std::memory_order_relaxed) + 1;
+        TraceSample = Sample <= 16 || !(Sample & (Sample - 1));
+        if (TraceSample) {
+          LogMan::Msg::IFmt("GN_SPLIT32 begin sample={} pc={:X} instruction={:08X} address={:X} jit={}",
+                           Sample, PC, Instruction, Address, IsJIT);
+        }
+      }
+    }
+  }
   const auto Result =
     FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(Thread, HandlerConfig->GetUnalignedHandlerType(), Context.Pc, &Context.X0, IsJIT);
+  if (SplitLockDiagnostic) {
+    int Tear32 = -1;
+    bool FirstTear {};
+#ifndef FEX_DISABLE_TELEMETRY
+    Tear32 = !!FEXCore::Telemetry::GetTelemetryValue(FEXCore::Telemetry::TYPE_CAS_32BIT_TEAR).load(std::memory_order_relaxed);
+    static std::atomic<bool> ReportedTear {};
+    if (Tear32) {
+      FirstTear = !ReportedTear.exchange(true, std::memory_order_relaxed);
+    }
+#endif
+    if (TraceSample || FirstTear) {
+      // This flag is process-wide: another thread may have set it. It is not attribution to this instruction.
+      LogMan::Msg::IFmt("GN_SPLIT32 end sample={} pc={:X} address={:X} jit={} handled={} advance={} process_tear32={}",
+                       Sample, PC, Address, IsJIT, Result.has_value(), Result.value_or(0), Tear32);
+    }
+  }
   Context.Pc += Result.value_or(0);
   return Result.has_value();
 }
@@ -649,7 +688,14 @@ NTSTATUS ProcessInit() {
   AppConfigName = FEX::Windows::BaseName(ExecutablePath);
   FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
+  SplitLockDiagnostic = AppConfigName == "mafiadefinitiveedition.exe";
+  if (SplitLockDiagnostic) {
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_SILENTLOG, "0");
+  }
   FEX::Windows::Logging::Init();
+  if (SplitLockDiagnostic) {
+    LogMan::Msg::IFmt("GN_SPLIT32 diagnostic active; sampled split accesses, process-wide tear flag; atomic semantics unchanged");
+  }
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
   FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, AppConfigName);
 
