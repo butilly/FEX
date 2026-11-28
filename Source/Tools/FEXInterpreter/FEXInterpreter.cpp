@@ -58,7 +58,6 @@ $end_info$
 #include <sys/auxv.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
-#include <sys/select.h>
 #include <system_error>
 #include <thread>
 #include <unistd.h>
@@ -434,7 +433,7 @@ int main(int argc, char** argv, char** const envp) {
   if (StallProcess) {
     while (1) {
       // Stall this process out forever
-      select(0, nullptr, nullptr, nullptr, nullptr);
+      ppoll(nullptr, 0, nullptr, nullptr);
     }
   }
 
@@ -550,10 +549,10 @@ int main(int argc, char** argv, char** const envp) {
   bool SupportsSVE256 {};
   fextl::unique_ptr<FEXCore::Context::Context> CTX;
   {
-    auto HostFeatures = FEX::FetchHostFeatures();
+    auto HostFeatures = FEX::FetchHostFeatures(Loader.Is64BitMode());
     CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
-    SupportsAVX = HostFeatures.SupportsAVX;
-    SupportsSVE256 = HostFeatures.SupportsSVE256;
+    SupportsAVX = HostFeatures.SupportsAVX();
+    SupportsSVE256 = HostFeatures.SupportsSVE256();
   }
 
   FEX::Kernel::Init(Loader.Is64BitMode(), CTX.get());

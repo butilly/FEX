@@ -64,6 +64,25 @@ static void SignalHandlerThunk(int Signal, siginfo_t* Info, void* UContext) {
   ThreadObject->SignalInfo.Delegator->HandleSignal(ThreadObject, Signal, Info, UContext);
 }
 
+[[noreturn]]
+void SynchronousExceptionHandler(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame) {
+  auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
+
+  auto& Fault = ThreadObject->Thread->CurrentFrame->SynchronousFaultData;
+  LOGMAN_THROW_A_FMT(Fault.FaultToTopAndGeneratedException, "Synchronous fault needs fault data!");
+
+#ifdef ARCHITECTURE_arm64
+  switch (Fault.Signal) {
+  case FEXCore::Core::FAULT_SIGILL: asm volatile("hlt #0"); break;
+  case FEXCore::Core::FAULT_SIGTRAP: asm volatile("brk #0"); break;
+  case FEXCore::Core::FAULT_SIGSEGV: asm volatile("mov x0, #0; ldr x0, [x0];" ::: "x0"); break;
+  default: LogMan::Msg::AFmt("Unknown fault signal {}!", Fault.Signal);
+  }
+#endif
+
+  ERROR_AND_DIE_FMT("This should always noreturn");
+}
+
 static uint64_t SigIsMember(GuestSAMask* Set, int Signal) {
   // Signal 0 isn't real, so everything is offset by one inside the set
   Signal -= 1;
@@ -400,6 +419,20 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
   // Set our state register to point to our guest thread data
   ArchHelpers::Context::SetState(ucontext, reinterpret_cast<uint64_t>(Frame));
 
+  if (GuestAction->sa_flags & SA_RESETHAND) {
+
+    {
+      // If SA_RESETHAND is set, then the signal handler is immediately reset to SIG_DFL.
+      std::lock_guard lk(GuestDelegatorMutex);
+      GuestAction->sigaction_handler.handler = SIG_DFL;
+    }
+
+    // If this signal is not required by FEX then we can fully uninstall the host handler as well.
+    if (HostHandlers[Signal].Required.load(std::memory_order_relaxed) != true) {
+      UninstallHostHandler(Signal);
+    }
+  }
+
   return true;
 }
 
@@ -585,6 +618,11 @@ bool SignalDelegator::HandleFrontendSIGSEGV(FEXCore::Core::InternalThreadState* 
     return true;
   }
 #endif
+
+  // If this fault is in the main thread stack guard region, we should try to grow the main thread stack.
+  if (SigInfo.si_code == SEGV_ACCERR && FEXCore::Allocator::TryGrowMainThreadStack(reinterpret_cast<uintptr_t>(SigInfo.si_addr))) {
+    return true;
+  }
 
   return false;
 }

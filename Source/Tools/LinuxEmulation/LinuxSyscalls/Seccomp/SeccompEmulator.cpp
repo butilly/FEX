@@ -10,12 +10,11 @@ $end_info$
 
 #include "LinuxSyscalls/x32/Syscalls.h"
 #include "LinuxSyscalls/x64/Syscalls.h"
+#include "LinuxSyscalls/Syscalls/Thread.h"
 #include "LinuxSyscalls/SignalDelegator.h"
 
-#include <CodeEmitter/Emitter.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/fextl/fmt.h>
-#include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
@@ -321,9 +320,15 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
     // Seccomp not installed. Allow it.
     return {false, 0};
   }
+
   // Reconstruct the RIP from the JITPC.
   auto Thread = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
   const uint64_t RIP = Thread->Thread->CTX->RestoreRIPFromHostPC(Frame->Thread, JITPC);
+
+  if (Thread->PrctlSetPending) {
+    Thread->PrctlSetPending = false;
+    ::prctl(PR_SET_NO_NEW_PRIVS, 1L, 0, 0, 0);
+  }
 
   const auto Arch = Is64BitMode() ? AUDIT_ARCH_X86_64 : AUDIT_ARCH_I386;
   bool ShouldLog {};
@@ -412,20 +417,11 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
   // Unknown actions behave like RET_KILL_PROCESS.
   default:
   case SECCOMP_RET_KILL_PROCESS: {
-    const int KillSignal = GetKillSignal();
-    // Ignores signal handler and sigmask
-    uint64_t Mask = 1ULL << (KillSignal - 1);
-    SignalDelegation->GuestSigProcMask(Thread, SIG_UNBLOCK, &Mask, nullptr);
-    SignalDelegation->UninstallHostHandler(KillSignal);
-    kill(0, KillSignal);
+    KillProcess(Thread);
     break;
   }
   case SECCOMP_RET_KILL_THREAD: {
-    // Ignores signal handler and sigmask
-    uint64_t Mask = 1 << (SIGSYS - 1);
-    SignalDelegation->GuestSigProcMask(Thread, SIG_UNBLOCK, &Mask, nullptr);
-    SignalDelegation->UninstallHostHandler(SIGSYS);
-    FHU::Syscalls::tgkill(::getpid(), ::gettid(), SIGSYS);
+    KillThread(Frame);
     break;
   }
   case SECCOMP_RET_TRAP: {
@@ -459,15 +455,73 @@ SeccompEmulator::ExecuteFilter(FEXCore::Core::CpuStateFrame* Frame, uint64_t JIT
   return {false, 0};
 }
 
+static inline bool CanChangeSeccompMode(const ThreadStateObject* Thread, uint32_t RequestedMode) {
+  if (Thread->SeccompMode == SECCOMP_MODE_DISABLED) {
+    return true;
+  }
+
+  return Thread->SeccompMode == RequestedMode;
+}
+
+const sock_fprog* SeccompEmulator::GetStrictModeFilter() const {
+#define syscall_nr (offsetof(struct seccomp_data, nr))
+#define ALLOW_SYSCALL(name) \
+  BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, FEX::HLE::x64::SYSCALL_x64_##name, 0, 1), BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW)
+#define ALLOW_SYSCALL_x32(name) \
+  BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, FEX::HLE::x32::SYSCALL_x86_##name, 0, 1), BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW)
+
+  /*
+   * Cite from seccomp(SECCOMP_SET_MODE_STRICT, ...) from man7.org
+   *
+   * The only system calls that the calling thread is permitted to make are read(2), write(2), _exit(3) (but not
+   * exit_group(2)), and sigreturn(2).  Other system calls result in the termination of the calling thread, or
+   * termination of the entire process with the SIGKILL signal when there is only one thread
+   */
+  constexpr static struct sock_filter strict_filter_x64[] = {
+    // Load syscall number
+    BPF_STMT(BPF_LD + BPF_W + BPF_ABS, syscall_nr),
+    // Declare allowed syscalls
+    ALLOW_SYSCALL(read),
+    ALLOW_SYSCALL(write),
+    ALLOW_SYSCALL(exit),
+    ALLOW_SYSCALL(rt_sigreturn),
+    BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_KILL_PROCESS),
+  };
+
+  constexpr static struct sock_filter strict_filter_x32[] = {
+    // Load syscall number
+    BPF_STMT(BPF_LD + BPF_W + BPF_ABS, syscall_nr),
+    // Declare allowed syscalls
+    ALLOW_SYSCALL_x32(read),
+    ALLOW_SYSCALL_x32(write),
+    ALLOW_SYSCALL_x32(exit),
+    ALLOW_SYSCALL_x32(rt_sigreturn),
+    ALLOW_SYSCALL_x32(sigreturn),
+    BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_KILL_PROCESS),
+  };
+
+  static const sock_fprog prog_x64 {
+    .len = (unsigned short)(sizeof(strict_filter_x64) / sizeof(strict_filter_x64[0])),
+    .filter = const_cast<struct sock_filter*>(strict_filter_x64),
+  };
+
+  static const sock_fprog prog_x32 {
+    .len = (unsigned short)(sizeof(strict_filter_x32) / sizeof(strict_filter_x32[0])),
+    .filter = const_cast<struct sock_filter*>(strict_filter_x32),
+  };
+
+  if (Is64BitMode()) {
+    return &prog_x64;
+  }
+
+  return &prog_x32;
+}
+
 // Equivalent to seccomp(SECCOMP_SET_MODE_STRICT, ...);
 uint64_t SeccompEmulator::SetModeStrict(FEXCore::Core::CpuStateFrame* Frame, uint32_t flags, const void* arg) {
   const auto Thread = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
 
-  if (::prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 0) {
-    // The caller did not have the CAP_SYS_ADMIN capability in its user namespace, or had not set no_new_privs before using SECCOMP_SET_MODE_FILTER.
-    return -EACCES;
-  }
-
+  // Same checks as in kernel for the strict mode
   if (flags != 0) {
     // The specified flags are invalid for the given operation.
     return -EINVAL;
@@ -478,56 +532,13 @@ uint64_t SeccompEmulator::SetModeStrict(FEXCore::Core::CpuStateFrame* Frame, uin
     return -EINVAL;
   }
 
-  if (Thread->SeccompMode == SECCOMP_MODE_FILTER) {
-    // Filter mode cannot move to strict
+  // If something set and it is not strict - no way to change
+  if (!CanChangeSeccompMode(Thread, SECCOMP_MODE_STRICT)) {
     return -EINVAL;
   }
 
-#define syscall_nr (offsetof(struct seccomp_data, nr))
-#define ALLOW_SYSCALL(name) \
-  BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, FEX::HLE::x64::SYSCALL_x64_##name, 0, 1), BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW)
-#define ALLOW_SYSCALL_x32(name) \
-  BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, FEX::HLE::x32::SYSCALL_x86_##name, 0, 1), BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW)
-
-  constexpr static struct sock_filter strict_filter_x64[] = {
-    // Load syscall number
-    BPF_STMT(BPF_LD + BPF_W + BPF_ABS, syscall_nr),
-
-    // Allow read, write, exit, exit_group, and sigreturn
-    ALLOW_SYSCALL(read),
-    ALLOW_SYSCALL(write),
-    ALLOW_SYSCALL(exit),
-    ALLOW_SYSCALL(exit_group),
-    ALLOW_SYSCALL(rt_sigreturn),
-    BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_KILL_PROCESS),
-  };
-
-  constexpr static struct sock_filter strict_filter_x32[] = {
-    // Load syscall number
-    BPF_STMT(BPF_LD + BPF_W + BPF_ABS, syscall_nr),
-
-    // Allow read, write, exit, exit_group, and sigreturn
-    ALLOW_SYSCALL_x32(read),
-    ALLOW_SYSCALL_x32(write),
-    ALLOW_SYSCALL_x32(exit),
-    ALLOW_SYSCALL_x32(exit_group),
-    ALLOW_SYSCALL_x32(rt_sigreturn),
-    ALLOW_SYSCALL_x32(sigreturn),
-    BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_KILL_PROCESS),
-  };
-
-  const sock_fprog prog_x64 {
-    .len = (unsigned short)(sizeof(strict_filter_x64) / sizeof(strict_filter_x64[0])),
-    .filter = const_cast<struct sock_filter*>(strict_filter_x64),
-  };
-
-  const sock_fprog prog_x32 {
-    .len = (unsigned short)(sizeof(strict_filter_x32) / sizeof(strict_filter_x32[0])),
-    .filter = const_cast<struct sock_filter*>(strict_filter_x32),
-  };
   CurrentKillSignal = SIGKILL;
-  const sock_fprog* prog = Is64BitMode() ? &prog_x64 : &prog_x32;
-  SetModeFilter(Frame, 0, prog);
+  SetModeFilter(Frame, 0, GetStrictModeFilter());
   Thread->SeccompMode = SECCOMP_MODE_STRICT;
 
   return 0;
@@ -590,12 +601,52 @@ void SeccompEmulator::TSyncFilters(FEXCore::Core::CpuStateFrame* Frame) {
       std::atomic_ref<uint64_t>(Filter->RefCount)++;
     }
     Thread->SeccompMode = ParentThread->SeccompMode;
+
+    // If the thread NO_NEW_PRIVS is not set it must be synced. But here we can not check is it set or set it.
+    // Thus do it at next syscall
+    Thread->PrctlSetPending = true;
   }
 }
+
+void SeccompEmulator::KillProcess(ThreadStateObject* Thread) {
+  const int KillSignal = GetKillSignal();
+
+  // Ignores signal handler and sigmask
+  uint64_t Mask = 1ULL << (KillSignal - 1);
+
+  SignalDelegation->GuestSigProcMask(Thread, SIG_UNBLOCK, &Mask, nullptr);
+  SignalDelegation->UninstallHostHandler(KillSignal);
+
+  kill(::getpid(), KillSignal);
+}
+
+void SeccompEmulator::KillThread(FEXCore::Core::CpuStateFrame* Frame) {
+  auto Thread = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
+
+  // Ignores signal handler and sigmask
+  uint64_t Mask = 1ULL << (SIGSYS - 1);
+
+  SignalDelegation->GuestSigProcMask(Thread, SIG_UNBLOCK, &Mask, nullptr);
+  SignalDelegation->UninstallHostHandler(SIGSYS);
+
+  // Kill only one thread, tgkill kills all thread group by default
+  if (SyscallHandler->TM.GetThreads()->size() != 1) {
+    // Gracefully destroy only one thread
+    SyscallExit(Frame, SIGSYS);
+    return;
+  }
+
+  FHU::Syscalls::tgkill(::getpid(), ::gettid(), SIGSYS);
+}
+
 
 // Equivalent to seccomp(SECCOMP_SET_MODE_FILTER, ...);
 uint64_t SeccompEmulator::SetModeFilter(FEXCore::Core::CpuStateFrame* Frame, uint32_t flags, const sock_fprog* prog) {
   auto Thread = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
+
+  if (!CanChangeSeccompMode(Thread, SECCOMP_MODE_FILTER)) {
+    KillProcess(Thread);
+  }
 
   // Order of checks in this function matter
   // 1) Check flags
@@ -650,30 +701,35 @@ uint64_t SeccompEmulator::SetModeFilter(FEXCore::Core::CpuStateFrame* Frame, uin
 
   if (DoingTsync) {
     auto TSyncThread = CanDoTSync(Frame);
+
     if (TSyncThread != 0) {
       if (flags & SECCOMP_FILTER_FLAG_TSYNC_ESRCH) {
         // This flag explicitly ensures that if TSYNC can't sync then it won't return a TID.
         return -ESRCH;
-      } else {
-        // Return the TID that caused a tsync problem.
-        return TSyncThread;
       }
+
+      // Return the TID that caused a tsync problem.
+      return TSyncThread;
     }
   }
 
   BPFEmitter emit {};
   const bool LoggingEnabled = flags & SECCOMP_FILTER_FLAG_LOG;
   auto Result = emit.JITFilter(flags, prog);
-  if (Result == 0) {
-    auto& it = Filters.emplace_back(SeccompFilterInfo {(SeccompFilterFunc)emit.GetFunc(), 1, emit.AllocationSize(), prog->len, LoggingEnabled});
-    TotalFilterInstructions += prog->len;
 
-    // Append the filter to the thread.
-    Thread->Filters.emplace_back(&it);
-    Thread->SeccompMode = SECCOMP_MODE_FILTER;
-    if (flags & SECCOMP_FILTER_FLAG_TSYNC) {
-      TSyncFilters(Frame);
-    }
+  if (Result) {
+    return Result;
+  }
+
+  auto& it = Filters.emplace_back(SeccompFilterInfo {(SeccompFilterFunc)emit.GetFunc(), 1, emit.AllocationSize(), prog->len, LoggingEnabled});
+  TotalFilterInstructions += prog->len;
+
+  // Append the filter to the thread.
+  Thread->Filters.emplace_back(&it);
+  Thread->SeccompMode = SECCOMP_MODE_FILTER;
+
+  if (flags & SECCOMP_FILTER_FLAG_TSYNC) {
+    TSyncFilters(Frame);
   }
 
   return Result;

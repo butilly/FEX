@@ -813,12 +813,15 @@ void OpDispatchBuilder::MOVMSKOpOne(OpcodeArgs) {
 }
 
 void OpDispatchBuilder::PUNPCKLOp(OpcodeArgs, IR::OpSize ElementSize) {
-  const auto Size = OpSizeFromSrc(Op);
+  const auto DstSize = OpSizeFromDst(Op);
+
+  // MMX only ever uses an m32 for the memory operand variant.
+  const auto SrcSize = (!Op->Src[0].IsGPR() && DstSize == OpSize::i64Bit) ? OpSize::i32Bit : DstSize;
 
   Ref Dest = LoadSourceFPR(Op, Op->Dest, Op->Flags);
-  Ref Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+  Ref Src = LoadSourceFPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags);
 
-  auto ALUOp = _VZip(Size, ElementSize, Dest, Src);
+  auto ALUOp = _VZip(DstSize, ElementSize, Dest, Src);
   StoreResult_WithAVXInsert(VectorOpType::SSE, RegClass::FPR, Op, ALUOp);
 }
 
@@ -1796,8 +1799,13 @@ Ref OpDispatchBuilder::SHUFOpImpl(IR::OpSize DstSize, IR::OpSize ElementSize, Re
   const uint8_t ShiftAmount = std::popcount(SelectionMask);
 
   const auto SingleLane = [&](Ref LHS, Ref RHS, uint32_t LaneShuffle) -> Ref {
+    if (LHS == RHS && ElementSize == OpSize::i32Bit) {
+      // With matching sources SHUFPS is PSHUFD: every immediate has a single-source implementation, e.g. a broadcast
+      // is one DUP instead of DUP+DUP+ZIP1, and the TBL fallback needs one table register instead of two.
+      // Compilers emit this a lot for float data, where PSHUFD would cross into the integer domain on x86.
+      return Single128Bit4ByteVectorShuffle(LHS, LaneShuffle);
+    }
     if (LHS == RHS && LaneShuffle == 0) {
-      // TODO: We can optimize significantly more shuffles when we know the sources match.
       // Special case broadcast element 0.
       return _VDupElement(DstSize, ElementSize, LHS, LaneShuffle & SelectionMask);
     }
@@ -3025,7 +3033,7 @@ void OpDispatchBuilder::XSaveOpImpl(OpcodeArgs) {
     StoreIfFlagSet(1, [this, Op] { SaveSSEState(XSaveBase(Op)); });
   }
   // AVX
-  if (CTX->HostFeatures.SupportsAVX) {
+  if (CTX->HostFeatures.SupportsAVX()) {
     StoreIfFlagSet(2, [this, Op] { std::invoke(SaveAVXStateFunc, this, XSaveBase(Op)); });
   }
 
@@ -3071,6 +3079,12 @@ void OpDispatchBuilder::SaveX87State(OpcodeArgs, Ref MemBase) {
   }
 
   { _StoreMemGPR(OpSize::i16Bit, ReconstructFSW_Helper(), MemBase, Constant(2), OpSize::i16Bit, MemOffsetType::SXTX, 1); }
+
+  {
+    auto FIPSize = Op->Flags & X86Tables::DecodeFlags::FLAG_REX_WIDENING ? OpSize::i64Bit : OpSize::i32Bit;
+    auto FIP = _LoadContextGPR(OpSize::i64Bit, offsetof(FEXCore::Core::CPUState, FIP));
+    _StoreMemGPR(FIPSize, FIP, MemBase, Constant(8), FIPSize, MemOffsetType::SXTX, 1);
+  }
 
   {
     // Abridged FTW
@@ -3173,7 +3187,7 @@ Ref OpDispatchBuilder::GetMXCSR() {
 void OpDispatchBuilder::FXRStoreOp(OpcodeArgs) {
   Ref Mem = MakeSegmentAddress(Op, Op->Src[0]);
 
-  RestoreX87State(Mem);
+  RestoreX87State(Op, Mem);
   RestoreSSEState(Mem);
 
   Ref MXCSR = _LoadMemGPR(OpSize::i32Bit, Mem, Constant(24), OpSize::i32Bit, MemOffsetType::SXTX, 1);
@@ -3219,14 +3233,14 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
 
   // x87
   {
-    RestoreIfFlagSetOrDefault(0, [this, Op] { RestoreX87State(XSaveBase(Op)); }, [this, Op] { DefaultX87State(Op); });
+    RestoreIfFlagSetOrDefault(0, [this, Op] { RestoreX87State(Op, XSaveBase(Op)); }, [this, Op] { DefaultX87State(Op); });
   }
   // SSE
   {
     RestoreIfFlagSetOrDefault(1, [this, Op] { RestoreSSEState(XSaveBase(Op)); }, [this] { DefaultSSEState(); });
   }
   // AVX
-  if (CTX->HostFeatures.SupportsAVX) {
+  if (CTX->HostFeatures.SupportsAVX()) {
     RestoreIfFlagSetOrDefault(
       2, [this, Op] { std::invoke(RestoreAVXStateFunc, this, XSaveBase(Op)); }, [this] { std::invoke(DefaultAVXStateFunc, this); });
   }
@@ -3244,7 +3258,7 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
   }
 }
 
-void OpDispatchBuilder::RestoreX87State(Ref MemBase) {
+void OpDispatchBuilder::RestoreX87State(OpcodeArgs, Ref MemBase) {
   _StackForceSlow();
 
   auto NewFCW = _LoadMemGPR(OpSize::i16Bit, MemBase, OpSize::i16Bit);
@@ -3254,6 +3268,12 @@ void OpDispatchBuilder::RestoreX87State(Ref MemBase) {
   {
     auto NewFSW = _LoadMemGPR(OpSize::i16Bit, MemBase, Constant(2), OpSize::i16Bit, MemOffsetType::SXTX, 1);
     Top = ReconstructX87StateFromFSW_Helper(NewFSW);
+  }
+
+  {
+    auto FIPSize = Op->Flags & X86Tables::DecodeFlags::FLAG_REX_WIDENING ? OpSize::i64Bit : OpSize::i32Bit;
+    auto FIP = _LoadMemGPR(FIPSize, MemBase, Constant(8), FIPSize, MemOffsetType::SXTX, 1);
+    _StoreContextGPR(OpSize::i64Bit, FIP, offsetof(FEXCore::Core::CPUState, FIP));
   }
 
   {
@@ -6054,6 +6074,88 @@ void OpDispatchBuilder::Insertq(OpcodeArgs) {
   Ref Result = _VAndn(OpSize::i64Bit, Dest, _VUShl(OpSize::i128Bit, OpSize::i64Bit, SrcMask, ShiftBits, false));
   Result = _VOr(OpSize::i64Bit, Result, SrcData);
   StoreResult_WithAVXInsert(VectorOpType::SSE, RegClass::FPR, Op, Result);
+}
+
+void OpDispatchBuilder::AVXVBCSTNEBF162PS(OpcodeArgs) {
+  const auto DstSize = OpSizeFromDst(Op);
+
+  auto Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+
+  // bfloat16 is converted to fp32 and broadcast through the vector.
+  // bfloat16->float32 is left-shift by 16.
+  Src = _VShlI(DstSize, OpSize::i32Bit, Src, 16);
+  Src = _VDupElement(DstSize, OpSize::i32Bit, Src, 0);
+
+  StoreResultFPR(Op, Src);
+}
+
+void OpDispatchBuilder::AVXVBCSTNESH2PS(OpcodeArgs) {
+  const auto DstSize = OpSizeFromDst(Op);
+
+  auto Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+
+  // float16 is converted to fp32 and broadcast through the vector.
+  Src = _Float_FToF(OpSize::i32Bit, OpSize::i16Bit, Src);
+  Src = _VDupElement(DstSize, OpSize::i32Bit, Src, 0);
+
+  StoreResultFPR(Op, Src);
+}
+
+void OpDispatchBuilder::AVXVCVTNEEPH2PS(OpcodeArgs, bool Even) {
+  const auto DstSize = OpSizeFromDst(Op);
+
+  auto Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+
+  // float16 is converted to fp32 and broadcast through the vector.
+  if (Even) {
+    Src = _VUnZip(DstSize, OpSize::i16Bit, Src, Src);
+  } else {
+    Src = _VUnZip2(DstSize, OpSize::i16Bit, Src, Src);
+  }
+  Src = _Vector_FToF(DstSize, OpSize::i32Bit, Src, OpSize::i16Bit);
+
+  StoreResultFPR(Op, Src);
+}
+
+void OpDispatchBuilder::AVXVCVTNEEBF162PS(OpcodeArgs, bool Even) {
+  const auto DstSize = OpSizeFromDst(Op);
+  auto Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+
+  auto Convert = [&](auto Src, bool Even) -> Ref {
+    // Even or odd elements of each 128-bit register is converted from bfloat16 to float32.
+    // For even, just left shift the elements.
+    if (Even) {
+      return _VShlI(DstSize, OpSize::i32Bit, Src, 16);
+    }
+
+    // For Odds, we just need to mask off the lower 16-bits of each 32-bit element.
+    // Can't do the same movi+vbsl instruction as ASIMD. Just use shifts instead.
+    auto Tmp = _VUShrI(DstSize, OpSize::i32Bit, Src, 16);
+    return _VShlI(DstSize, OpSize::i32Bit, Tmp, 16);
+  };
+  StoreResultFPR(Op, Convert(Src, Even));
+}
+
+void OpDispatchBuilder::AVXVCVTNEPS2BF16(OpcodeArgs) {
+  const auto DstSize = OpSizeFromDst(Op);
+  const auto Is128Bit = DstSize == OpSize::i128Bit;
+
+  auto Src = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+
+  // Convert 4 or 8 32-bits floats in to bfloat16.
+  // This instruction only operates with rounding mode set to `Rounds to Nearest (even)`.
+  Ref Result {};
+  if (Is128Bit) {
+    // Just do the operation in the lower half of the register.
+    Result = _VBFCVTN(OpSize::i128Bit, Src);
+  } else {
+    // Split the operation in to two and recombine.
+    Ref UpperLane = _VDupElement(OpSize::i256Bit, OpSize::i128Bit, Src, 1);
+    auto ResultLow = _VBFCVTN(OpSize::i128Bit, Src);
+    Result = _VBFCVTN2(OpSize::i128Bit, ResultLow, UpperLane);
+  }
+
+  StoreResultFPR(Op, Result);
 }
 
 } // namespace FEXCore::IR

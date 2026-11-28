@@ -371,6 +371,7 @@ public:
     FEX_CONFIG_OPT(SoftwareRNG, SOFTWARERNG);
     FEX_CONFIG_OPT(StrictInProcessSplitLocks, STRICTINPROCESSSPLITLOCKS);
     FEX_CONFIG_OPT(MonoHacks, MONOHACKS);
+    FEX_CONFIG_OPT(JITFeatures, JITFEATURES);
   } Config;
 
   bool SoftwareRNGEnabled() const {
@@ -455,14 +456,6 @@ public:
     UpdateAtomicTSOEmulationConfig();
   }
 
-  void EnableExitOnHLT() override {
-    ExitOnHLT = true;
-  }
-
-  bool ExitOnHLTEnabled() const {
-    return ExitOnHLT;
-  }
-
   bool AreMonoHacksActive() const {
     return Config.MonoHacks && MonoDetected;
   }
@@ -498,7 +491,6 @@ private:
   bool VectorAtomicTSOEmulationEnabled = false;
   bool MemcpyAtomicTSOEmulationEnabled = false;
 
-  bool ExitOnHLT = false;
   FEX_CONFIG_OPT(AppFilename, APP_FILENAME);
 
   std::shared_mutex CustomIRMutex;
